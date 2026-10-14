@@ -2019,6 +2019,24 @@ Adjust redirect request priority relative to original request:
 - **a positive priority adjust (default) means higher priority.**
 - a negative priority adjust means lower priority.
 
+.. setting:: REQUEST_TIMING_ENABLED
+
+REQUEST_TIMING_ENABLED
+----------------------
+
+Default: ``False``
+
+Whether to measure how long each request spends in each stage of its
+lifecycle: the scheduler queue, the downloader middlewares, the downloader
+slot, the download, the scraper queue, the callback or errback, and the item
+pipelines. The results are aggregated under the :ref:`timing stats
+<topics-stats>`, and the per-request durations are stored in the
+:reqmeta:`request_timing` meta key. Requests created by retries and
+redirects are measured separately and linked through
+:attr:`~scrapy.http.Request.parent_id`.
+
+When disabled, no timings are taken and no related stats are written.
+
 .. setting:: ROBOTSTXT_OBEY
 
 ROBOTSTXT_OBEY

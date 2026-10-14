@@ -7,6 +7,7 @@ import logging
 import warnings
 from collections import deque
 from collections.abc import AsyncIterator
+from time import monotonic
 from typing import TYPE_CHECKING, Any, TypeAlias, TypeVar
 
 from twisted.internet.defer import Deferred, inlineCallbacks
@@ -265,6 +266,9 @@ class Scraper:
                 f"Incorrect type: expected Response or Failure, got {type(result)}: {result!r}"
             )
 
+        if timing := self.crawler.request_timing:
+            timing.scrape_started(request)
+
         output: Iterable[Any] | AsyncIterator[Any]
         if isinstance(result, Response):
             try:
@@ -319,6 +323,9 @@ class Scraper:
             queue_dfd.errback(Failure())
         else:
             queue_dfd.callback(None)  # awaited in enqueue_scrape()
+        finally:
+            if timing := self.crawler.request_timing:
+                timing.finish_request(request)
 
     def call_spider(
         self, result: Response | Failure, request: Request, spider: Spider | None = None
@@ -339,6 +346,7 @@ class Scraper:
         """
         await _process_pending_io_before_callback()
         assert self.crawler.spider
+        timing = self.crawler.request_timing
         if isinstance(result, Response):
             if getattr(result, "request", None) is None:
                 result.request = request
@@ -346,6 +354,7 @@ class Scraper:
             parent_id = result.request.id
             callback = result.request.callback or self.crawler.spider._parse
             warn_on_generator_with_return_value(self.crawler.spider, callback)
+            callback_started = monotonic() if timing is not None else 0.0
             output = callback(result, **result.request.cb_kwargs)
             if isinstance(output, Deferred):
                 warnings.warn(
@@ -361,6 +370,7 @@ class Scraper:
             if not request.errback:
                 result.raiseException()
             warn_on_generator_with_return_value(self.crawler.spider, request.errback)
+            callback_started = monotonic() if timing is not None else 0.0
             output = request.errback(result)
             if isinstance(output, Failure):
                 output.raiseException()
@@ -374,6 +384,8 @@ class Scraper:
                     stacklevel=2,
                 )
         output = await ensure_awaitable(iterate_spider_output(output))
+        if timing is not None:
+            output = timing.time_callback_output(request, output, callback_started)
         if isinstance(output, AsyncIterator):
             return _aset_parent_id(output, parent_id)
         return _set_parent_id(output, parent_id)
@@ -529,6 +541,8 @@ class Scraper:
         assert self.slot is not None  # typing
         assert self.crawler.spider is not None  # typing
         self.slot.itemproc_size += 1
+        timing = self.crawler.request_timing
+        item_started = monotonic() if timing is not None else 0.0
         try:
             if self._itemproc_has_async["process_item"]:
                 output = await self.itemproc.process_item_async(item)
@@ -580,4 +594,6 @@ class Scraper:
                 spider=self.crawler.spider,
             )
         finally:
+            if timing is not None:
+                timing.record_item_pipeline(response, monotonic() - item_started)
             self.slot.itemproc_size -= 1

@@ -2,6 +2,16 @@
 Some pipelines used for testing
 """
 
+import time
+
+
+class DelayPipeline:
+    delay = 0.05
+
+    def process_item(self, item):
+        time.sleep(self.delay)
+        return item
+
 
 class ZeroDivisionErrorPipeline:
     def open_spider(self):

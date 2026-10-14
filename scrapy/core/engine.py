@@ -513,6 +513,9 @@ class ExecutionEngine:
             self.signals.send_catch_log(signals.scheduler_empty)
             return False
 
+        if timing := self.crawler.request_timing:
+            timing.dequeued(request)
+
         d: Deferred[Response | Request] = self._download(request)
         d.addBoth(self._handle_downloader_output, request)
         d.addErrback(
@@ -555,10 +558,16 @@ class ExecutionEngine:
                 asyncio.exceptions.CancelledError,
             )
         ):
+            if timing := self.crawler.request_timing:
+                timing.discard_request(request)
             return
 
         # downloader middleware can return requests (for example, redirects)
         if isinstance(result, Request):
+            if timing := self.crawler.request_timing:
+                # The derived request gets its own record and links to this
+                # one through its parent_id; this one ends here.
+                timing.finish_request(request)
             self.crawl(result)
             return
 
@@ -619,6 +628,8 @@ class ExecutionEngine:
             self.signals.send_catch_log(
                 signals.request_dropped, request=request, spider=self.spider
             )
+        elif timing := self.crawler.request_timing:
+            timing.enqueued(request)
 
     def download(self, request: Request) -> Deferred[Response]:
         """Return a Deferred which fires with a Response as result, only downloader middlewares are applied"""
@@ -647,6 +658,8 @@ class ExecutionEngine:
                 assert self._slot is not None
                 self._slot.remove_request(request)
             if not isinstance(response_or_request, Request):
+                if timing := self.crawler.request_timing:
+                    timing.finish_request(request)
                 return response_or_request
             request = response_or_request
 
@@ -682,6 +695,8 @@ class ExecutionEngine:
                     request=result.request,
                     spider=self.spider,
                 )
+                if timing := self.crawler.request_timing:
+                    timing.response_received(result.request)
             return result
         finally:
             self._slot.nextcall.schedule()

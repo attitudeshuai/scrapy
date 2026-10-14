@@ -15,6 +15,7 @@ from twisted.internet.defer import Deferred, DeferredList, inlineCallbacks
 from scrapy import Spider
 from scrapy.addons import AddonManager
 from scrapy.core.engine import EngineState, ExecutionEngine
+from scrapy.core.timing import _RequestTiming
 from scrapy.exceptions import ScrapyDeprecationWarning
 from scrapy.extension import ExtensionManager
 from scrapy.settings import SETTINGS_PRIORITIES, Settings, overridden_settings
@@ -162,6 +163,7 @@ class Crawler:
         self._logformatter: LogFormatter | None = None
         self._request_fingerprinter: RequestFingerprinterProtocol | None = None
         self._stats: StatsCollector | None = None
+        self.request_timing: _RequestTiming | None = None
 
     def _set_force_stop_callback(
         self,
@@ -186,6 +188,9 @@ class Crawler:
             "max_concurrent_requests", "CONCURRENT_REQUESTS_PER_DOMAIN"
         )
         self.stats = load_object(self.settings["STATS_CLASS"])(self)
+
+        if self.settings.getbool("REQUEST_TIMING_ENABLED"):
+            self.request_timing = build_from_crawler(_RequestTiming, self)
 
         lf_cls: type[LogFormatter] = load_object(self.settings["LOG_FORMATTER"])
         self.logformatter = build_from_crawler(lf_cls, self)

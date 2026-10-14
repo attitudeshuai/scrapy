@@ -781,6 +781,51 @@ one per actual value of the placeholder.
 
     Set by :class:`~scrapy.extensions.corestats.CoreStats`.
 
+.. stat:: timing/stage/{stage}/{metric}
+
+``timing/stage/{stage}/{metric}``
+    Per-stage request lifecycle timings, in seconds, collected when the
+    :setting:`REQUEST_TIMING_ENABLED` setting is enabled, aggregated across
+    all requests. ``{metric}`` is one of ``count``, ``total``, ``min`` and
+    ``max``; divide *total* by *count* for the average.
+
+.. stat:: timing/domain/{domain}/{stage}/{metric}
+
+``timing/domain/{domain}/{stage}/{metric}``
+    Same as :stat:`timing/stage/{stage}/{metric}`, but aggregated per
+    downloader slot (the domain by default).
+
+    ``{stage}`` is one of:
+
+    - ``scheduler_wait``: time spent in the :ref:`scheduler
+      <topics-scheduler>` queue.
+    - ``downloader_request_middleware``: time spent in the
+      ``process_request`` chain of the :ref:`downloader middlewares
+      <topics-downloader-middleware>`. When a middleware provides a response
+      without downloading, e.g. from the HTTP cache, this stage covers the
+      whole downloader middleware processing instead.
+    - ``downloader_slot_wait``: time spent waiting in a downloader slot (see
+      :setting:`DOWNLOAD_SLOTS`) because of its concurrency limit or
+      download delay.
+    - ``download``: download time, same values as the
+      :reqmeta:`download_latency` request meta key.
+    - ``downloader_response_middleware``: time spent in the
+      ``process_response`` chain of the :ref:`downloader middlewares
+      <topics-downloader-middleware>`.
+    - ``scraper_wait``: time between the response reaching the
+      :ref:`scraper <topics-architecture>` and the callback or errback
+      starting.
+    - ``callback``: time spent in the callback or errback.
+    - ``item_pipeline``: time spent processing an item in the
+      :ref:`item pipelines <topics-item-pipeline>`, attributed to the
+      request that produced the item.
+
+    The duration of every measured stage of an individual request is also
+    stored under the :reqmeta:`request_timing` meta key. Requests created by
+    retries and redirects are measured independently and link to the
+    original request through
+    :attr:`~scrapy.http.Request.parent_id`.
+
 .. stat:: urllength/request_ignored_count
 
 ``urllength/request_ignored_count``

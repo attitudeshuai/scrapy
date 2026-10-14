@@ -223,6 +223,8 @@ class Downloader:
         self, request: Request, spider: Spider | None = None
     ) -> Generator[Deferred[Any], Any, Response | Request]:
         self.active.add(request)
+        if timing := self.crawler.request_timing:
+            timing.fetch_started(request)
         try:
             result: Response | Request = yield (
                 deferred_from_coro(
@@ -279,6 +281,8 @@ class Downloader:
             request=request,
             spider=self.crawler.spider,
         )
+        if timing := self.crawler.request_timing:
+            timing.reached_downloader(request)
         d: Deferred[Response] = Deferred()
         slot.queue.append((request, d))
         self._process_queue(slot)
@@ -331,6 +335,8 @@ class Downloader:
         # The order is very important for the following logic. Do not change!
         try:
             # 1. Download the response
+            if timing := self.crawler.request_timing:
+                timing.download_started(request)
             response: Response = await self.handlers.download_request_async(request)
             # 2. Notify response_downloaded listeners about the recent download
             # before querying queue for next request
@@ -340,6 +346,8 @@ class Downloader:
                 request=request,
                 spider=self.crawler.spider,
             )
+            if timing := self.crawler.request_timing:
+                timing.response_downloaded(request)
             return response
         except Exception:
             await _process_pending_io()

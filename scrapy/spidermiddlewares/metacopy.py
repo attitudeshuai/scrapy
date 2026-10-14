@@ -27,6 +27,7 @@ class MetaCopyDetectionMiddleware(BaseSpiderMiddleware):
             "_scheme_proxy",
             "cache_timestamp",
             "download_latency",
+            "request_timing",
             "redirect_reasons",
             "redirect_times",
             "redirect_ttl",

@@ -193,6 +193,7 @@ __all__ = [
     "REMOTE_CONTROL_TIMEOUT_MAX",
     "REMOTE_CONTROL_TRACEBACK_MAX_BYTES",
     "REQUEST_FINGERPRINTER_CLASS",
+    "REQUEST_TIMING_ENABLED",
     "RETRY_ENABLED",
     "RETRY_EXCEPTIONS",
     "RETRY_GIVE_UP_LOG_LEVEL",
@@ -544,6 +545,11 @@ REMOTE_CONTROL_OUTPUT_MAX_BYTES = 64 * 1024
 REMOTE_CONTROL_TRACEBACK_MAX_BYTES = 16 * 1024
 
 REQUEST_FINGERPRINTER_CLASS = "scrapy.utils.request.RequestFingerprinter"
+
+# Whether to collect per-request lifecycle stage timings (scheduler queue,
+# downloader middlewares, downloader slot, download, scraper queue, callback
+# and item pipelines), aggregated under the timing/* stats keys.
+REQUEST_TIMING_ENABLED = False
 
 RETRY_ENABLED = True
 RETRY_EXCEPTIONS = [

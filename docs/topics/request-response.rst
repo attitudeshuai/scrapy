@@ -840,6 +840,7 @@ Those are:
 * :reqmeta:`redirect_ttl`
 * :reqmeta:`redirect_urls`
 * :reqmeta:`referrer_policy`
+* :reqmeta:`request_timing`
 * :reqmeta:`retry_times`
 * :reqmeta:`rule`
 * :reqmeta:`skip_dupefilter_once`
@@ -994,6 +995,21 @@ max_retry_times
 The meta key is used set retry times per request. When set, the
 :reqmeta:`max_retry_times` meta key takes higher precedence over the
 :setting:`RETRY_TIMES` setting.
+
+.. reqmeta:: request_timing
+
+request_timing
+--------------
+
+.. versionadded:: VERSION
+
+A dict mapping :ref:`timing stats <topics-stats>` stage names to the time
+the request spent in each measured stage, in seconds. It is set when the
+:setting:`REQUEST_TIMING_ENABLED` setting is enabled, once the request has
+reached the end of the stages it went through. It is read-only, like
+:reqmeta:`download_latency`. Requests created by retries and redirects get
+their own dict and link to the original request through
+:attr:`~scrapy.http.Request.parent_id`.
 
 .. reqmeta:: skip_dupefilter_once
 
