@@ -106,6 +106,26 @@ Let's take an example using :ref:`coroutines <topics-coroutines>`:
 See the :ref:`topics-signals-ref` below to know which signals support
 :class:`~twisted.internet.defer.Deferred` and :term:`awaitable objects <awaitable>`.
 
+.. _signal-governance:
+
+Signal handler governance
+=========================
+
+Signal handlers run inside the crawling event loop, so a slow handler delays
+everything else that happens in the crawl. Enable
+:setting:`SIGNALS_GOVERNANCE_ENABLED` to make signal dispatching record how
+long each handler takes:
+
+- Handlers slower than :setting:`SIGNALS_HANDLER_WARN_THRESHOLD` seconds log a
+  warning that names both the signal and the handler.
+- :ref:`Asynchronous handlers <signal-deferred>` that take longer than
+  :setting:`SIGNALS_HANDLER_TIMEOUT` seconds are cancelled, logged and counted
+  as failures, while the other handlers of the signal keep running. Synchronous
+  handlers cannot be interrupted, but their duration is still recorded.
+- Aggregated per-signal and per-handler counts (calls, total and maximum
+  duration, failures, timeouts) can be read from
+  :meth:`~scrapy.signalmanager.SignalManager.get_handler_stats`.
+
 .. _topics-signals-ref:
 
 Built-in signals reference

@@ -146,7 +146,7 @@ class Crawler:
         self._update_logging()
 
         self.addons: AddonManager = AddonManager(self)
-        self.signals: SignalManager = SignalManager(self)
+        self.signals: SignalManager = build_from_crawler(SignalManager, self)
 
         self._init_reactor: bool = init_reactor
         self.crawling: bool = False

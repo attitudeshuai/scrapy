@@ -2195,6 +2195,50 @@ Soft limit (in bytes) for response data being processed.
 While the sum of the sizes of all responses being processed is above this value,
 Scrapy does not process new requests.
 
+.. setting:: SIGNALS_GOVERNANCE_ENABLED
+
+SIGNALS_GOVERNANCE_ENABLED
+--------------------------
+
+Default: ``False``
+
+Whether to enable the governance of signal dispatching. When enabled, Scrapy
+measures how long each signal handler takes, logs a warning for handlers slower
+than :setting:`SIGNALS_HANDLER_WARN_THRESHOLD`, cancels asynchronous handlers
+slower than :setting:`SIGNALS_HANDLER_TIMEOUT`, and keeps per-signal and
+per-handler timing and failure counts available through
+:meth:`scrapy.signalmanager.SignalManager.get_handler_stats`.
+
+When disabled, signal dispatching behaves exactly as without governance:
+handler order, return values and exception handling are unchanged. See
+:ref:`signal-governance` for more information.
+
+.. setting:: SIGNALS_HANDLER_TIMEOUT
+
+SIGNALS_HANDLER_TIMEOUT
+-----------------------
+
+Default: ``30.0``
+
+Maximum time, in seconds, that an :ref:`asynchronous signal handler
+<signal-deferred>` may take when :setting:`SIGNALS_GOVERNANCE_ENABLED` is
+enabled. Handlers that do not finish in time are cancelled, the cancellation
+is logged as a warning and the handler is counted as a failure. Other handlers
+of the same signal are not affected. Synchronous handlers cannot be
+interrupted; only their duration is recorded. Set to ``None`` to disable the
+timeout.
+
+.. setting:: SIGNALS_HANDLER_WARN_THRESHOLD
+
+SIGNALS_HANDLER_WARN_THRESHOLD
+------------------------------
+
+Default: ``1.0``
+
+Duration, in seconds, after which a signal handler is logged as slow when
+:setting:`SIGNALS_GOVERNANCE_ENABLED` is enabled. The warning identifies both
+the signal and the handler. Set to ``None`` to disable the warning.
+
 .. setting:: SPIDER_CONTRACTS
 
 SPIDER_CONTRACTS
