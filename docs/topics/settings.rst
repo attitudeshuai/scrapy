@@ -585,6 +585,53 @@ project name). This name will be used for the logging too.
 It's automatically populated with your project name when you create your
 project with the :command:`startproject` command.
 
+.. setting:: COMPONENT_FAILURE_MAX_FAILURES
+
+COMPONENT_FAILURE_MAX_FAILURES
+------------------------------
+
+Default: ``0``
+
+The maximum number of failures of an
+:ref:`extension, middleware, or item pipeline <topics-components>` within
+:setting:`COMPONENT_FAILURE_WINDOW` seconds after which the component is
+:ref:`isolated <component-failures>`: its hooks stop being called
+until the crawl ends or the isolation is reset with
+:meth:`~scrapy.crawler.Crawler.reset_component_isolation`. Set to ``0`` to
+never isolate components.
+
+.. versionadded:: VERSION
+
+.. setting:: COMPONENT_FAILURE_POLICIES
+
+COMPONENT_FAILURE_POLICIES
+--------------------------
+
+Default: ``{}``
+
+A dictionary that maps the import path of an
+:ref:`extension, middleware, or item pipeline <topics-components>` to the
+policy followed when the component fails to load or initialize at startup.
+The supported policies are ``'raise'``, which aborts the crawl (the
+default), and ``'skip'``, which logs the error, excludes the component from
+the crawl, and records it in
+:meth:`~scrapy.crawler.Crawler.get_component_failures`.
+
+.. versionadded:: VERSION
+
+.. setting:: COMPONENT_FAILURE_WINDOW
+
+COMPONENT_FAILURE_WINDOW
+------------------------
+
+Default: ``60.0``
+
+The length, in seconds, of the sliding time window in which the failures of
+a component are counted towards the
+:setting:`COMPONENT_FAILURE_MAX_FAILURES` threshold.
+
+.. versionadded:: VERSION
+
 .. setting:: CONCURRENT_ITEMS
 
 CONCURRENT_ITEMS

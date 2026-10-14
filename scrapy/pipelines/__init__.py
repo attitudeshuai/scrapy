@@ -47,6 +47,7 @@ class ItemProcessorProtocol(Protocol):
 
 class ItemPipelineManager(MiddlewareManager):
     component_name = "item pipeline"
+    _component_setting_name = "ITEM_PIPELINES"
 
     @classmethod
     def _get_mwlist_from_settings(cls, settings: Settings) -> list[Any]:

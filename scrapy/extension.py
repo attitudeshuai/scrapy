@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 class ExtensionManager(MiddlewareManager):  # pylint: disable=abstract-method
     component_name = "extension"
+    _component_setting_name = "EXTENSIONS"
 
     @classmethod
     def _get_mwlist_from_settings(cls, settings: Settings) -> list[Any]:

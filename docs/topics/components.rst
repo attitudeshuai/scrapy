@@ -144,6 +144,76 @@ If your requirement is a minimum Scrapy version, you may use
                     f"generator."
                 )
 
+.. _component-failures:
+
+Failure handling
+================
+
+.. versionadded:: VERSION
+
+Failures of :ref:`extensions <topics-extensions>`, :ref:`downloader
+middlewares <topics-downloader-middleware>`, :ref:`spider middlewares
+<topics-spider-middleware>`, and :ref:`item pipelines <topics-item-pipeline>`
+can be isolated from the rest of the crawl.
+
+Startup failures
+----------------
+
+A component can opt out of the crawl by raising
+:exc:`~scrapy.exceptions.NotConfigured` when it is initialized. This is meant
+for components that are disabled through their settings.
+
+Any other failure while loading the component class or initializing the
+component aborts the crawl by default. Assign the import path of the
+component the ``'skip'`` policy in the
+:setting:`COMPONENT_FAILURE_POLICIES` setting to instead log the error and
+run the crawl without the component:
+
+.. code-block:: python
+
+    COMPONENT_FAILURE_POLICIES = {
+        "myproject.extensions.MonitoringExtension": "skip",
+    }
+
+The components that were skipped, together with their error and traceback,
+are returned by :meth:`~scrapy.crawler.Crawler.get_component_failures`.
+
+Run-time failures
+-----------------
+
+When a component raises an exception from one of its hooks, the exception is
+still handled exactly as before, but it is also accounted against the
+component. Once the same component fails
+:setting:`COMPONENT_FAILURE_MAX_FAILURES` times within
+:setting:`COMPONENT_FAILURE_WINDOW` seconds, it is isolated: its hooks are
+no longer called, as if the component did not define them, until the crawl
+ends or the isolation is lifted.
+
+Exceptions that are part of the regular flow of requests and items are not
+accounted: :exc:`~scrapy.exceptions.IgnoreRequest`,
+:exc:`~scrapy.exceptions.DropItem`, :exc:`~scrapy.exceptions.CloseSpider`,
+:exc:`~scrapy.exceptions.DontCloseSpider`,
+:exc:`~scrapy.exceptions.StopDownload`, and
+:exc:`~scrapy.exceptions.NotConfigured`.
+
+Signal handlers keep their catch-and-log behavior and are never isolated.
+Isolation therefore does not apply to extensions, which connect to
+:ref:`signals <topics-signals>` instead of defining hooks.
+
+The isolated components are returned by
+:meth:`~scrapy.crawler.Crawler.get_isolated_components`, which reports the
+number of failures, the last error, and the number of hooks that were
+skipped. The isolation can be lifted with
+:meth:`~scrapy.crawler.Crawler.reset_component_isolation`, passing a
+component class, an import path, or a component instance:
+
+.. code-block:: python
+
+    crawler.reset_component_isolation(MonitoringMiddleware)
+
+Failures, isolations, and skipped hooks are also counted in the
+:ref:`stats <topics-stats>` under the ``component_failures/`` prefix.
+
 API reference
 =============
 

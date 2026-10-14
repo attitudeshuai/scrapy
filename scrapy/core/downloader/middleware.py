@@ -13,12 +13,11 @@ from typing import TYPE_CHECKING, Any
 
 from scrapy.exceptions import CloseSpider, ScrapyDeprecationWarning, _InvalidOutput
 from scrapy.http import Request, Response
-from scrapy.middleware import MiddlewareManager
+from scrapy.middleware import MiddlewareManager, _isolated_hook
 from scrapy.utils.conf import build_component_list
 from scrapy.utils.defer import (
     _process_pending_io,
     deferred_from_coro,
-    ensure_awaitable,
     maybe_deferred_to_future,
 )
 from scrapy.utils.python import global_object_name
@@ -35,6 +34,7 @@ if TYPE_CHECKING:
 
 class DownloaderMiddlewareManager(MiddlewareManager):  # pylint: disable=abstract-method
     component_name = "downloader middleware"
+    _component_setting_name = "DOWNLOADER_MIDDLEWARES"
 
     def __init__(self, *middlewares: Any, crawler: Crawler | None = None) -> None:
         super().__init__(*middlewares, crawler=crawler)
@@ -99,11 +99,10 @@ class DownloaderMiddlewareManager(MiddlewareManager):  # pylint: disable=abstrac
             result, _ = await self._process_exception(ex, request)
         return await self._process_response(result, request)
 
-    def _handle_mw_method(self, method: Callable[..., Any], **kwargs: Any) -> Any:
+    def _hook_kwargs(self, method: Callable[..., Any], **kwargs: Any) -> dict[str, Any]:
         if method in self._mw_methods_requiring_spider:
             kwargs["spider"] = self._spider
-
-        return method(**kwargs)
+        return kwargs
 
     async def _process_request(
         self,
@@ -112,10 +111,13 @@ class DownloaderMiddlewareManager(MiddlewareManager):  # pylint: disable=abstrac
     ) -> Response | Request:
         for method in self.methods["process_request"]:
             assert method is not None
-            response = await ensure_awaitable(
-                self._handle_mw_method(method, request=request),
+            response = await self._call_hook(
+                method,
                 _warn=global_object_name(method),
+                **self._hook_kwargs(method, request=request),
             )
+            if response is _isolated_hook:
+                continue
             if response is not None and not isinstance(response, (Response, Request)):
                 raise _InvalidOutput(
                     f"Middleware {method.__qualname__} must return None, Response or "
@@ -140,9 +142,10 @@ class DownloaderMiddlewareManager(MiddlewareManager):  # pylint: disable=abstrac
             if method is None:
                 continue
             try:
-                result = await ensure_awaitable(
-                    self._handle_mw_method(method, request=request, response=response),
+                result = await self._call_hook(
+                    method,
                     _warn=global_object_name(method),
+                    **self._hook_kwargs(method, request=request, response=response),
                 )
             except Exception as ex:
                 if not self._response_exceptions:
@@ -154,6 +157,8 @@ class DownloaderMiddlewareManager(MiddlewareManager):  # pylint: disable=abstrac
                 response, index = await self._process_exception(ex, request, index)
                 continue
 
+            if result is _isolated_hook:
+                continue
             if not isinstance(result, (Response, Request)):
                 raise _InvalidOutput(
                     f"Middleware {method.__qualname__} must return Response or Request, "
@@ -216,10 +221,13 @@ class DownloaderMiddlewareManager(MiddlewareManager):  # pylint: disable=abstrac
             index += 1
             if method is None:
                 continue
-            response = await ensure_awaitable(
-                self._handle_mw_method(method, request=request, exception=exception),
+            response = await self._call_hook(
+                method,
                 _warn=global_object_name(method),
+                **self._hook_kwargs(method, request=request, exception=exception),
             )
+            if response is _isolated_hook:
+                continue
             if response is not None and not isinstance(response, (Response, Request)):
                 raise _InvalidOutput(
                     f"Middleware {method.__qualname__} must return None, Response or "

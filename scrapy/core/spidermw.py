@@ -20,7 +20,7 @@ from twisted.python.failure import Failure
 from scrapy import Request, Spider
 from scrapy.exceptions import ScrapyDeprecationWarning, _InvalidOutput
 from scrapy.http import Response
-from scrapy.middleware import MiddlewareManager
+from scrapy.middleware import MiddlewareManager, _isolated_hook
 from scrapy.utils.asyncgen import as_async_generator
 from scrapy.utils.conf import build_component_list
 from scrapy.utils.defer import (
@@ -48,6 +48,7 @@ ScrapeFunc: TypeAlias = Callable[
 
 class SpiderMiddlewareManager(MiddlewareManager):  # pylint: disable=abstract-method
     component_name = "spider middleware"
+    _component_setting_name = "SPIDER_MIDDLEWARES"
 
     @classmethod
     def _get_mwlist_from_settings(cls, settings: BaseSettings) -> list[Any]:
@@ -83,9 +84,13 @@ class SpiderMiddlewareManager(MiddlewareManager):  # pylint: disable=abstract-me
             assert method is not None
             try:
                 if method in self._mw_methods_requiring_spider:
-                    result = method(response=response, spider=self._spider)
+                    result = await self._call_hook(
+                        method, response=response, spider=self._spider
+                    )
                 else:
-                    result = method(response=response)
+                    result = await self._call_hook(method, response=response)
+                if result is _isolated_hook:
+                    continue
                 if result is not None:
                     msg = (
                         f"{global_object_name(method)} must return None "
@@ -104,6 +109,8 @@ class SpiderMiddlewareManager(MiddlewareManager):  # pylint: disable=abstract-me
         iterable: AsyncIterator[_T],
         exception_processor_index: int,
         recover_to: _MutableAsyncChain[_T],
+        *,
+        owner: Callable[..., Any] | None = None,
     ) -> AsyncIterator[_T]:
         try:
             async for r in iterable:
@@ -111,6 +118,8 @@ class SpiderMiddlewareManager(MiddlewareManager):  # pylint: disable=abstract-me
         except Exception as ex:
             if getattr(ex, "_spidermw_unhandled", False):
                 raise
+            if owner is not None:
+                self._record_hook_failure(owner, ex)
             exception_result: _MutableAsyncChain[_T] = self._process_spider_exception(
                 response, ex, exception_processor_index
             )
@@ -131,12 +140,20 @@ class SpiderMiddlewareManager(MiddlewareManager):  # pylint: disable=abstract-me
         for method_index, method in enumerate(method_list, start=start_index):
             if method is None:
                 continue
-            if method in self._mw_methods_requiring_spider:
-                result = method(
-                    response=response, exception=exception, spider=self._spider
-                )
-            else:
-                result = method(response=response, exception=exception)
+            if self._hook_is_isolated(method):
+                continue
+            try:
+                if method in self._mw_methods_requiring_spider:
+                    result = method(
+                        response=response,
+                        exception=exception,
+                        spider=self._spider,
+                    )
+                else:
+                    result = method(response=response, exception=exception)
+            except Exception as hook_error:
+                self._record_hook_failure(method, hook_error)
+                raise
             if isinstance(result, (Iterable, AsyncIterator)):
                 # stop exception handling by handing control over to the
                 # process_spider_output chain if an iterable has been returned
@@ -176,12 +193,20 @@ class SpiderMiddlewareManager(MiddlewareManager):  # pylint: disable=abstract-me
         for method_index, method in enumerate(method_list, start=start_index):
             if method is None:
                 continue
-            if method in self._mw_methods_requiring_spider:
-                result = method(response=response, result=result, spider=self._spider)
-            else:
-                result = method(response=response, result=result)
+            if self._hook_is_isolated(method):
+                continue
+            try:
+                if method in self._mw_methods_requiring_spider:
+                    result = method(
+                        response=response, result=result, spider=self._spider
+                    )
+                else:
+                    result = method(response=response, result=result)
+            except Exception as hook_error:
+                self._record_hook_failure(method, hook_error)
+                raise
             result = self._evaluate_iterable(
-                response, result, method_index + 1, recovered
+                response, result, method_index + 1, recovered, owner=method
             )
         return _MutableAsyncChain(result, recovered)
 

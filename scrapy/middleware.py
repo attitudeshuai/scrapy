@@ -8,6 +8,7 @@ from collections import defaultdict, deque
 from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, Self, TypeVar, cast
 
 from scrapy.exceptions import NotConfigured, ScrapyDeprecationWarning
+from scrapy.utils.conf import build_component_list
 from scrapy.utils.defer import ensure_awaitable
 from scrapy.utils.deprecate import argument_is_required
 from scrapy.utils.misc import build_from_crawler, load_object
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
     from twisted.internet.defer import Deferred
 
     from scrapy import Spider
+    from scrapy._component_failures import _ComponentFailureRegistry
     from scrapy.crawler import Crawler
     from scrapy.settings import Settings
 
@@ -29,14 +31,29 @@ _T = TypeVar("_T")
 _P = ParamSpec("_P")
 
 
+class _IsolatedHook:
+    """Returned instead of calling the hook of an isolated component."""
+
+
+_isolated_hook = _IsolatedHook()
+
+
 class MiddlewareManager(ABC):
     """Base class for implementing middleware managers"""
 
     component_name: str
+    # Name of the component priority dictionary setting of this manager.
+    # When set, a component list that cannot be normalized because one of
+    # its paths fails to import is rebuilt without the normalization, so the
+    # offending path is handled per component instead of killing the crawl.
+    _component_setting_name: str | None = None
     _compat_spider: Spider | None = None
 
     def __init__(self, *middlewares: object, crawler: Crawler | None = None) -> None:
         self.crawler: Crawler | None = crawler
+        self._component_failures: _ComponentFailureRegistry | None = getattr(
+            crawler, "_component_failures", None
+        )
         if crawler is None:
             warnings.warn(
                 f"MiddlewareManager.__init__() was called without the crawler argument"
@@ -82,16 +99,37 @@ class MiddlewareManager(ABC):
         raise NotImplementedError
 
     @classmethod
+    def _get_mwlist(cls, settings: Settings) -> tuple[list[Any], Exception | None]:
+        """Return the component list and the failure of its normalization.
+
+        Normalizing the list imports every configured component path, so a
+        single bad path aborts the whole list. When that happens, fall back
+        to the unnormalized list: the bad path then fails on its own and can
+        be handled according to the configured failure policy.
+        """
+        try:
+            return cls._get_mwlist_from_settings(settings), None
+        except ValueError as normalization_failure:
+            setting_name = cls._component_setting_name
+            if setting_name is None:
+                raise
+            return (
+                build_component_list(settings.getwithbase(setting_name)),
+                normalization_failure,
+            )
+
+    @classmethod
     def from_crawler(cls, crawler: Crawler) -> Self:
-        mwlist = cls._get_mwlist_from_settings(crawler.settings)
+        failures: _ComponentFailureRegistry | None = getattr(
+            crawler, "_component_failures", None
+        )
+        mwlist, normalization_failure = cls._get_mwlist(crawler.settings)
         middlewares = []
         enabled = []
         for clspath in mwlist:
             try:
                 mwcls = load_object(clspath)
                 mw = build_from_crawler(mwcls, crawler)
-                middlewares.append(mw)
-                enabled.append(clspath)
             except NotConfigured as e:
                 if e.args:
                     logger.warning(
@@ -99,6 +137,20 @@ class MiddlewareManager(ABC):
                         {"clspath": clspath, "eargs": e.args[0]},
                         extra={"crawler": crawler},
                     )
+            except Exception as error:
+                path = (
+                    clspath if isinstance(clspath, str) else global_object_name(clspath)
+                )
+                if failures is not None and failures.record_assembly_failure(
+                    path, cls.component_name, error
+                ):
+                    continue
+                if normalization_failure is not None:
+                    raise normalization_failure from error
+                raise
+            else:
+                middlewares.append(mw)
+                enabled.append(clspath)
 
         logger.info(
             "Enabled %(componentname)ss:\n%(enabledlist)s",
@@ -108,7 +160,57 @@ class MiddlewareManager(ABC):
             },
             extra={"crawler": crawler},
         )
-        return cls(*middlewares, crawler=crawler)
+        manager = cls(*middlewares, crawler=crawler)
+        if failures is not None:
+            for mw in middlewares:
+                failures.register(
+                    mw, global_object_name(mw.__class__), cls.component_name
+                )
+        return manager
+
+    def _hook_is_isolated(self, method: Callable[..., Any]) -> bool:
+        """Return whether the component of the bound *method* is isolated.
+
+        Record the skipped call when it is.
+        """
+        failures = self._component_failures
+        if failures is None:
+            return False
+        component = getattr(method, "__self__", None)
+        if not failures.is_isolated(component):
+            return False
+        failures.record_skipped_hook(component)
+        return True
+
+    def _record_hook_failure(
+        self, method: Callable[..., Any], error: Exception
+    ) -> None:
+        if self._component_failures is not None:
+            self._component_failures.record_runtime_failure(
+                getattr(method, "__self__", None), error
+            )
+
+    async def _call_hook(
+        self,
+        method: Callable[..., Any],
+        *args: Any,
+        _warn: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Call the bound component *method*.
+
+        Skip the call while the component is isolated and return the
+        _isolated_hook sentinel. Otherwise record any exception it raises
+        before re-raising it, so the failure handling of the caller stays
+        unchanged.
+        """
+        if self._hook_is_isolated(method):
+            return _isolated_hook
+        try:
+            return await ensure_awaitable(method(*args, **kwargs), _warn=_warn)
+        except Exception as error:
+            self._record_hook_failure(method, error)
+            raise
 
     def _add_middleware(self, mw: Any) -> None:  # noqa: B027
         pass
@@ -139,14 +241,17 @@ class MiddlewareManager(ABC):
         )
         for method in methods:
             warn = global_object_name(method) if warn_deferred else None
+            result: Any
             if always_add_spider or (
                 add_spider and method in self._mw_methods_requiring_spider
             ):
-                obj = await ensure_awaitable(
-                    method(obj, *(*args, self._spider)), _warn=warn
+                result = await self._call_hook(
+                    method, obj, *(*args, self._spider), _warn=warn
                 )
             else:
-                obj = await ensure_awaitable(method(obj, *args), _warn=warn)
+                result = await self._call_hook(method, obj, *args, _warn=warn)
+            if result is not _isolated_hook:
+                obj = result
         return obj
 
     def open_spider(self, spider: Spider) -> Deferred[list[None]]:  # pragma: no cover

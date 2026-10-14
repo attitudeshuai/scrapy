@@ -13,6 +13,11 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar, overload
 from twisted.internet.defer import Deferred, DeferredList, inlineCallbacks
 
 from scrapy import Spider
+from scrapy._component_failures import (
+    _AssemblyFailureRecord,
+    _ComponentFailureRegistry,
+    _IsolationRecord,
+)
 from scrapy.addons import AddonManager
 from scrapy.core.engine import EngineState, ExecutionEngine
 from scrapy.exceptions import ScrapyDeprecationWarning
@@ -147,6 +152,9 @@ class Crawler:
 
         self.addons: AddonManager = AddonManager(self)
         self.signals: SignalManager = SignalManager(self)
+        self._component_failures: _ComponentFailureRegistry = _ComponentFailureRegistry(
+            self
+        )
 
         self._init_reactor: bool = init_reactor
         self.crawling: bool = False
@@ -483,6 +491,35 @@ class Crawler:
                 "crawl engine has been created."
             )
         return self._get_component(cls, self.engine.scraper.spidermw.middlewares)
+
+    def get_component_failures(self) -> list[_AssemblyFailureRecord]:
+        """Return the records of the components that failed to load or
+        initialize and were skipped at startup according to their
+        :setting:`COMPONENT_FAILURE_POLICIES` policy.
+
+        .. versionadded:: VERSION
+        """
+        return self._component_failures.get_assembly_failures()
+
+    def get_isolated_components(self) -> list[_IsolationRecord]:
+        """Return the run-time failure records of the components that are
+        currently isolated after repeatedly failing, see
+        :setting:`COMPONENT_FAILURE_MAX_FAILURES`.
+
+        .. versionadded:: VERSION
+        """
+        return self._component_failures.get_isolated_components()
+
+    def reset_component_isolation(self, component: type | str | object) -> list[str]:
+        """Lift the isolation of the components matching *component*, which
+        can be a component class, the import path of a component, or a
+        component instance. Their hooks are called again on subsequent
+        requests and items. Return the import paths of the matched
+        components.
+
+        .. versionadded:: VERSION
+        """
+        return self._component_failures.reset(component)
 
 
 class CrawlerRunnerBase(ABC):
