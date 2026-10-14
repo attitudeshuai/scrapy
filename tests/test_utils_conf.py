@@ -197,6 +197,8 @@ class TestFeedExportConfig:
         new_feed = feed_complete_default_values_from_settings(feed, settings)
         assert new_feed == {
             "mode": None,
+            "atomic_delivery": False,
+            "keep_failed_staging": False,
             "encoding": "custom encoding",
             "fields": ["f1", "f2", "f3"],
             "indent": 42,
@@ -223,6 +225,8 @@ class TestFeedExportConfig:
         new_feed = feed_complete_default_values_from_settings(feed, settings)
         assert new_feed == {
             "mode": None,
+            "atomic_delivery": False,
+            "keep_failed_staging": False,
             "encoding": "other encoding",
             "fields": None,
             "indent": 42,

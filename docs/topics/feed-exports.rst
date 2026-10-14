@@ -171,6 +171,8 @@ specify a path (e.g. ``/tmp/export.csv``). Alternatively, you can use a
 Supported :ref:`modes <feed-mode>`: ``"append"``, ``"create"`` and
 ``"overwrite"``. If :setting:`FEED_MODE` is ``None``, ``"append"`` is used.
 
+It supports :ref:`atomic file delivery <atomic-delivery>` in all modes.
+
 .. _topics-feed-storage-ftp:
 .. _feed-storage-ftp:
 
@@ -202,7 +204,9 @@ Supported :ref:`modes <feed-mode>`: ``"append"``, ``"create"`` and
           written. Servers that do not support the ``SIZE`` command are
           reported as not having the target.
 
-This storage backend uses :ref:`delayed file delivery <delayed-file-delivery>`.
+This storage backend uses :ref:`delayed file delivery <delayed-file-delivery>`
+and supports :ref:`atomic file delivery <atomic-delivery>` in ``"create"`` and
+``"overwrite"`` mode, uploading to a temporary name and renaming the target.
 
 
 .. _feed-storage-ftps:
@@ -267,7 +271,8 @@ Supported :ref:`modes <feed-mode>`: ``"create"`` and ``"overwrite"``. If
 ``"create"`` mode `does not support files larger than 5 GB
 <https://docs.aws.amazon.com/AmazonS3/latest/userguide/upload-objects.html>`__.
 
-This storage backend uses :ref:`delayed file delivery <delayed-file-delivery>`.
+This storage backend uses :ref:`delayed file delivery <delayed-file-delivery>`
+and supports :ref:`atomic file delivery <atomic-delivery>`.
 
 
 .. _topics-feed-storage-gcs:
@@ -301,7 +306,8 @@ checksum but no MD5 hash.
 .. versionadded:: VERSION
    Appending support.
 
-This storage backend uses :ref:`delayed file delivery <delayed-file-delivery>`.
+This storage backend uses :ref:`delayed file delivery <delayed-file-delivery>`
+and supports :ref:`atomic file delivery <atomic-delivery>` in all modes.
 
 
 
@@ -317,6 +323,9 @@ The feeds are written to the standard output of the Scrapy process.
 -   Required external libraries: none
 
 The :ref:`mode <feed-mode>` is ignored by this storage backend.
+
+:ref:`Atomic file delivery <atomic-delivery>` is not supported: it is ignored
+with a warning when requested.
 
 
 .. _delayed-file-delivery:
@@ -337,6 +346,139 @@ backends, use :setting:`FEED_EXPORT_BATCH_ITEM_COUNT` to split the output items
 in multiple files, with the specified maximum item count per file. That way, as
 soon as a file reaches the maximum item count, that file is delivered to the
 feed URI, allowing item delivery to start way before the end of the crawl.
+
+
+.. _atomic-delivery:
+
+Atomic file delivery
+--------------------
+
+.. versionadded:: VERSION
+
+By default, feeds are written and delivered the same way they always have
+been: the local filesystem storage writes to the target path as items are
+scraped, and the delayed-delivery backends upload their temporary file at the
+end of the crawl. Enabling atomic delivery, with the
+:setting:`FEED_ATOMIC_DELIVERY` setting or the ``atomic_delivery``
+:ref:`feed option <feed-options>`, changes the delivery of a feed file to a
+three-step process:
+
+#.  Items are written to a staging file instead of the target. For the local
+    filesystem, this is a hidden file in the directory of the target (its name
+    ends with :file:`.staging`), so that it stays on the same filesystem.
+    Delayed-delivery backends reuse their temporary file, located in
+    :setting:`FEED_TEMPDIR`.
+
+#.  Once the file is complete, it is finalized and validated: the item
+    exporter writes its footer, the post-processing plugins close, the file is
+    flushed to disk, and its size and SHA-256 checksum are computed.
+
+#.  The file is delivered to the target in a single operation. If any step
+    fails before or during that operation, the target is left exactly as it
+    was before the delivery; no truncated file ever appears at the target
+    location.
+
+The checksum and the size cover the bytes of the staging file. In append mode
+(see below) that is the appended portion, not the pre-existing content of the
+target.
+
+Backend semantics
+~~~~~~~~~~~~~~~~~
+
+-   The local filesystem storage replaces the target with
+    :meth:`pathlib.Path.replace` in ``"overwrite"`` mode. In ``"create"``
+    mode it links the staging file to the target with :func:`os.link`, which
+    fails without touching an existing target; the storage must run on a
+    filesystem that supports hard links. In ``"append"`` mode, the old target
+    and the staging file are written into a second staging file that replaces
+    the target, so appending rewrites the whole file and requires enough disk
+    space for both the old and the new content.
+-   S3 and GCS replace the stored object atomically: a failed upload leaves
+    the object that was already stored untouched. GCS appends by composing
+    objects, which switches the target atomically; the temporary part object
+    is removed when the composition fails. Parts of an aborted S3 multipart
+    upload are not visible as the object and expire according to the bucket
+    lifecycle rules.
+-   FTP and FTPS upload the file to a temporary name and rename it to the
+    target in ``"overwrite"`` and ``"create"`` modes; the rename must support
+    replacing an existing target, as most Unix FTP servers do. Appending is
+    not available with atomic delivery because FTP can only append by
+    streaming to the target (``APPE``); enabling both raises an error before
+    the crawl starts.
+-   The standard output storage cannot stage a stream: requesting atomic
+    delivery for it logs a warning and writes to the stream directly.
+
+Failed staging files
+~~~~~~~~~~~~~~~~~~~~
+
+Staging files of deliveries that fail inside the Scrapy process are removed by
+default. Set :setting:`FEED_ATOMIC_DELIVERY_KEEP_STAGING`, or the
+``keep_failed_staging`` feed option, to keep them for inspection instead; the
+path of the retained file is logged and reported in the delivery manifest.
+For the local filesystem, retained staging files are hidden files in the
+directory of the target; for delayed-delivery backends, they stay in
+:setting:`FEED_TEMPDIR`.
+
+If the Scrapy process is killed (for example by a power loss), no cleanup runs:
+staging files may remain in the locations above and can be deleted manually.
+The target itself is never modified by such an interrupted delivery.
+
+Append mode
+~~~~~~~~~~~
+
+Outside atomic delivery, ``"append"`` mode writes new bytes to the target as
+the crawl runs, so a failure may leave the target partially appended. With
+atomic delivery the target is only touched at the single commit point: it
+either keeps its old content or ends with the old content followed by all the
+new entries. The delivery manifest reports the appended bytes only, not the
+whole resulting target.
+
+Batch delivery
+~~~~~~~~~~~~~~
+
+Every file of a feed that uses
+:setting:`FEED_EXPORT_BATCH_ITEM_COUNT` goes through the staging, validation
+and commit steps independently, as soon as its batch is full. A failed batch
+does not remove a previously delivered batch and does not prevent later
+batches from being delivered. Each batch gets its own manifest entry, with its
+URI, batch ID, entry count, size, checksum and status.
+
+Delivery manifest
+~~~~~~~~~~~~~~~~~
+
+After a feed file is delivered, the resulting
+:class:`~scrapy.extensions.feedexport.FeedDelivery` is available as the
+``delivery`` attribute of the slot when the :signal:`feed_slot_closed` signal
+is sent. When the whole feed export is done,
+the :signal:`feed_exporter_closed` signal receives the complete manifest as its
+``manifest`` argument, a tuple with one entry per delivered file (including
+every batch). The same tuple is available as the ``manifest`` attribute of the
+:class:`~scrapy.extensions.feedexport.FeedExporter` extension.
+
+.. autoclass:: scrapy.extensions.feedexport.FeedDelivery
+
+For example, a signal handler can persist the manifest of a crawl:
+
+.. code-block:: python
+
+    from scrapy import signals
+
+
+    class FeedManifestStore:
+        def __init__(self, crawler):
+            crawler.signals.connect(
+                self.feed_exporter_closed,
+                signal=signals.feed_exporter_closed,
+            )
+
+        @classmethod
+        def from_crawler(cls, crawler):
+            return cls(crawler)
+
+        def feed_exporter_closed(self, manifest):
+            for delivery in manifest:
+                if delivery.status == "delivered":
+                    ...  # record delivery.uri, delivery.checksum, ...
 
 
 .. _topics-feed-storage-custom:
@@ -370,11 +512,42 @@ URI scheme through the :setting:`FEED_STORAGES` setting.
       :exc:`FileExistsError` if the target exists. Scrapy then handles that
       file as described in :setting:`FEED_MODE`.
 
+   .. attribute:: supports_atomic_delivery
+      :type: bool
+
+      Whether the storage supports :ref:`atomic file delivery
+      <atomic-delivery>`. When it is missing or false, enabling atomic
+      delivery on a feed that uses the storage raises an error that prevents
+      the crawl from running.
+
+      .. versionadded:: VERSION
+
+      When true, :meth:`~scrapy.extensions.feedexport.FeedStorageProtocol.open`
+      must return a seekable file on the local filesystem (with a ``name``),
+      where the feed is staged, and
+      :meth:`~scrapy.extensions.feedexport.FeedStorageProtocol.store` must be
+      the single operation that puts the staged file at the target; a failure
+      must leave the target untouched. The file is flushed, checksummed and
+      seeked back to its start before ``store()`` is called.
+
+   .. attribute:: atomic_modes
+      :type: frozenset[str] | None
+
+      Subset of :attr:`supported_modes` in which atomic delivery works, e.g.
+      ``frozenset({"create", "overwrite"})`` for the FTP storage. When
+      absent, every supported mode is assumed compatible with atomic
+      delivery.
+
+      .. versionadded:: VERSION
+
 If your storage backend blocks, subclass
 :class:`~scrapy.extensions.feedexport.BlockingFeedStorage` instead: it writes
 items into a temporary local file (see :ref:`delayed file delivery
 <delayed-file-delivery>`) and calls your ``_store_in_thread()`` method in a
-separate thread once the crawl is done, keeping the reactor free.
+separate thread once the crawl is done, keeping the reactor free. Pass the
+``feed_options`` to the parent constructor to inherit atomic delivery; the
+base class then stages into a named temporary file and removes it after a
+successful upload, or applies the failed-staging policy on an upload failure.
 
 .. autoclass:: scrapy.extensions.feedexport.BlockingFeedStorage
    :members: _store_in_thread
@@ -518,6 +691,8 @@ Settings
 These are the settings used for configuring the feed exports:
 
 -   :setting:`FEEDS` (mandatory)
+-   :setting:`FEED_ATOMIC_DELIVERY`
+-   :setting:`FEED_ATOMIC_DELIVERY_KEEP_STAGING`
 -   :setting:`FEED_EXPORT_ENCODING`
 -   :setting:`FEED_MODE`
 -   :setting:`FEED_STORE_EMPTY`
@@ -620,6 +795,15 @@ as a fallback value if that key is not provided for a specific feed definition:
 
     .. versionadded:: VERSION
 
+-   ``atomic_delivery``: falls back to :setting:`FEED_ATOMIC_DELIVERY`.
+
+    .. versionadded:: VERSION
+
+-   ``keep_failed_staging``: falls back to
+    :setting:`FEED_ATOMIC_DELIVERY_KEEP_STAGING`.
+
+    .. versionadded:: VERSION
+
 -   ``store_empty``: falls back to :setting:`FEED_STORE_EMPTY`.
 
 -   ``uri_params``: falls back to :setting:`FEED_URI_PARAMS`.
@@ -706,6 +890,37 @@ would have contained are lost.
 .. note:: When resuming a crawl (see :setting:`JOBDIR`), the feed of the
     previous run already exists, so a feed that must survive a resumed crawl
     needs the ``"append"`` mode.
+
+.. setting:: FEED_ATOMIC_DELIVERY
+
+FEED_ATOMIC_DELIVERY
+--------------------
+
+.. versionadded:: VERSION
+
+Default: ``False``
+
+Whether feed files are :ref:`atomically delivered <atomic-delivery>`: written
+to a staging file, validated and committed to the target in one operation, so
+that a failure leaves the target untouched.
+
+Can be overridden with the ``atomic_delivery`` :ref:`feed option
+<feed-options>`.
+
+.. setting:: FEED_ATOMIC_DELIVERY_KEEP_STAGING
+
+FEED_ATOMIC_DELIVERY_KEEP_STAGING
+---------------------------------
+
+.. versionadded:: VERSION
+
+Default: ``False``
+
+Whether staging files of failed atomic deliveries are kept for inspection
+instead of being removed. See :ref:`atomic-delivery`.
+
+Can be overridden with the ``keep_failed_staging`` :ref:`feed option
+<feed-options>`.
 
 .. setting:: FEED_STORE_EMPTY
 

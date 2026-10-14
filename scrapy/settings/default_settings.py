@@ -87,6 +87,8 @@ __all__ = [
     "EXTENSIONS",
     "EXTENSIONS_BASE",
     "FEEDS",
+    "FEED_ATOMIC_DELIVERY",
+    "FEED_ATOMIC_DELIVERY_KEEP_STAGING",
     "FEED_EXPORTERS",
     "FEED_EXPORTERS_BASE",
     "FEED_EXPORT_BATCH_ITEM_COUNT",
@@ -379,6 +381,8 @@ EXTENSIONS_BASE = {
     "scrapy.extensions.remote_control.RemoteControl": 0,
 }
 
+FEED_ATOMIC_DELIVERY = False
+FEED_ATOMIC_DELIVERY_KEEP_STAGING = False
 FEEDS: dict[str | Path, dict[str, Any]] = {}
 FEED_EXPORT_BATCH_ITEM_COUNT = 0
 FEED_EXPORT_ENCODING = None

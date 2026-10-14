@@ -389,20 +389,34 @@ feed_slot_closed
 
     This signal supports :ref:`asynchronous handlers <signal-deferred>`.
 
-    :param slot: the slot closed
+    :param slot: the slot closed. Its ``delivery`` attribute is the
+        :class:`~scrapy.extensions.feedexport.FeedDelivery` of the slot, or
+        ``None`` if the slot did not deliver a file
+
+        .. versionadded:: VERSION
+
     :type slot: scrapy.extensions.feedexport.FeedSlot
 
 feed_exporter_closed
 ~~~~~~~~~~~~~~~~~~~~
 
 .. signal:: feed_exporter_closed
-.. function:: feed_exporter_closed()
+.. function:: feed_exporter_closed(manifest)
 
     Sent when the :ref:`feed exports <topics-feed-exports>` extension is closed,
     during the handling of the :signal:`spider_closed` signal by the extension,
     after all feed exporting has been handled.
 
     This signal supports :ref:`asynchronous handlers <signal-deferred>`.
+
+    :param manifest: tuple with one
+        :class:`~scrapy.extensions.feedexport.FeedDelivery` per delivered
+        file, including every file of a batched feed
+
+        .. versionadded:: VERSION
+
+    :type manifest:
+        tuple[scrapy.extensions.feedexport.FeedDelivery, ...]
 
 memusage_warning_reached
 ~~~~~~~~~~~~~~~~~~~~~~~~

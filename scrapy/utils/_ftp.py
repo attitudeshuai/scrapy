@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import posixpath
-from contextlib import closing
+from contextlib import closing, suppress
 from ftplib import FTP, FTP_TLS, error_perm
 from posixpath import dirname
 from ssl import create_default_context
 from typing import IO
+from uuid import uuid4
 
 
 def ftp_makedirs_cwd(ftp: FTP, path: str, first_call: bool = True) -> None:
@@ -45,6 +46,7 @@ def ftp_store_file(
     mode: str | None = None,
     tls: bool = False,
     timeout: float | None = None,
+    atomic: bool = False,
 ) -> None:
     """Opens a FTP connection with passed credentials, sets current directory
     to the directory extracted from given path, then uploads the file to server.
@@ -54,6 +56,12 @@ def ftp_store_file(
 
     ``"create"`` is best-effort: FTP has no atomic create-if-absent command, so
     the file is checked for existence right before it is written.
+
+    When *atomic* is true (only for ``"create"`` and ``"overwrite"``), the
+    file is uploaded to a temporary name in the target directory and then
+    renamed to *path*, so a failed upload leaves the target untouched. The
+    rename must support replacing an existing target, as most Unix FTP servers
+    do.
 
     If *tls* is ``True``, the connection is secured with TLS (FTPS), and the
     certificate of the server is verified.
@@ -79,5 +87,17 @@ def ftp_store_file(
         ftp_makedirs_cwd(ftp, dirname)
         if mode == "create" and _ftp_file_exists_in_cwd(ftp, filename):
             raise FileExistsError(f"{path} already exists")
-        command = "APPE" if mode == "append" else "STOR"
-        ftp.storbinary(f"{command} {filename}", file)
+        if not atomic:
+            command = "APPE" if mode == "append" else "STOR"
+            ftp.storbinary(f"{command} {filename}", file)
+            return
+        staging_name = f".{filename}.staging-{uuid4().hex}"
+        try:
+            ftp.storbinary(f"STOR {staging_name}", file)
+            ftp.rename(staging_name, filename)
+        except Exception:
+            # Remove the partial upload so the failed delivery leaves no
+            # remote staging file behind.
+            with suppress(error_perm):
+                ftp.delete(staging_name)
+            raise

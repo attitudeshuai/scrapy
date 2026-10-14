@@ -146,6 +146,11 @@ def feed_complete_default_values_from_settings(
             )
         out["mode"] = "overwrite" if out.pop("overwrite") else "append"
     out.setdefault("mode", settings["FEED_MODE"])
+    out.setdefault("atomic_delivery", settings.getbool("FEED_ATOMIC_DELIVERY"))
+    out.setdefault(
+        "keep_failed_staging",
+        settings.getbool("FEED_ATOMIC_DELIVERY_KEEP_STAGING"),
+    )
     if out["mode"] in {"append", "overwrite"}:
         # Kept for feed storages that were written before the mode feed option
         # existed and hence only look for the overwrite feed option.

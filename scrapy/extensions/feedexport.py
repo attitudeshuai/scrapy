@@ -8,12 +8,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
+import os
 import re
+import shutil
 import sys
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PureWindowsPath
 from tempfile import NamedTemporaryFile
@@ -87,6 +91,51 @@ _ItemProcessor: TypeAlias = Callable[[Any], Iterable[Any]]
 
 
 _FEED_MODES: frozenset[str] = frozenset({"append", "create", "overwrite"})
+
+#: Algorithm of the checksum in :class:`FeedDelivery` records.
+_CHECKSUM_ALGORITHM = "sha256"
+
+#: Values of :attr:`FeedDelivery.status`.
+_DELIVERY_DELIVERED = "delivered"
+_DELIVERY_FAILED = "failed"
+_DELIVERY_SKIPPED = "skipped"
+
+
+@dataclass(frozen=True, slots=True)
+class FeedDelivery:
+    """The delivery result of one feed file.
+
+    One object is produced per delivered file, so a feed that uses
+    :setting:`FEED_EXPORT_BATCH_ITEM_COUNT` produces one object per batch.
+    The objects are available as :attr:`FeedSlot.delivery` through the
+    :signal:`feed_slot_closed` signal, and as the *manifest* keyword argument
+    of the :signal:`feed_exporter_closed` signal.
+
+    *uri* is the target URI of the file, *batch_id* is its 1-based batch
+    number, *format* is its serialization format, and *storage* is the class
+    name of its storage backend. *item_count* is the number of entries the
+    file contains. *size* is its size in bytes and *checksum* is its
+    checksum, computed with *checksum_algorithm*; the two latter are only
+    available when the feed uses :ref:`atomic delivery <atomic-delivery>`.
+    *status* is ``"delivered"``, ``"failed"`` or ``"skipped"`` (the target
+    existed in ``"create"`` mode). *error* describes a failed delivery, and
+    *staging_path* is the retained staging file of a failed delivery, when
+    the feed is configured to keep it.
+
+    .. versionadded:: VERSION
+    """
+
+    uri: str
+    batch_id: int
+    format: str
+    storage: str
+    item_count: int
+    size: int | None
+    checksum: str | None
+    status: str
+    error: str | None = None
+    staging_path: str | None = None
+    checksum_algorithm: str = _CHECKSUM_ALGORITHM
 
 
 def _get_mode(storage: Any, feed_options: dict[str, Any] | None, legacy: str) -> str:
@@ -194,19 +243,92 @@ class FeedStorageProtocol(Protocol):
            This method may now be a coroutine function (``async def``).
         """
 
+    supports_atomic_delivery: bool
+
+    atomic_modes: frozenset[str] | None
+
+
+def _staging_name(file: IO[bytes]) -> str | None:
+    """Return the filesystem path of staging *file*, or ``None`` if it does
+    not have one."""
+    name = getattr(file, "name", None)
+    return str(name) if name else None
+
+
+def _remove_staging(file: IO[bytes]) -> None:
+    """Remove the staging *file*, ignoring missing files and removal errors.
+
+    The file is expected to be already closed."""
+    name = _staging_name(file)
+    if name:
+        with contextlib.suppress(OSError):
+            Path(name).unlink(missing_ok=True)
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Flush the metadata of *directory*, so that a file rename in it
+    survives a power loss. Only POSIX allows opening a directory for
+    ``fsync``; this is a no-op elsewhere or on filesystems that reject it."""
+    if os.name != "posix":
+        return
+    dir_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
 
 class BlockingFeedStorage(ABC):
     """Base class for feed storages that store feeds using blocking code."""
+
+    supports_atomic_delivery: bool = False
+    atomic_modes: frozenset[str] | None = None
+
+    def __init__(self, *, feed_options: dict[str, Any] | None = None) -> None:
+        feed_options = feed_options or {}
+        self._atomic_delivery_enabled: bool = bool(feed_options.get("atomic_delivery"))
+        self._keep_failed_staging_enabled: bool = bool(
+            feed_options.get("keep_failed_staging")
+        )
 
     def open(self, spider: Spider) -> IO[bytes]:
         path = spider.crawler.settings["FEED_TEMPDIR"]
         if path and not Path(path).is_dir():
             raise OSError("Not a Directory: " + str(path))
 
+        if self._is_atomic():
+            # The FeedExporter removes the file once the upload succeeds, or
+            # keeps it for inspection when the upload fails and the feed is
+            # configured to do so.
+            return NamedTemporaryFile(prefix="feed-", dir=path, delete=False)
         return NamedTemporaryFile(prefix="feed-", dir=path)
 
+    def _is_atomic(self) -> bool:
+        # getattr() keeps subclasses that predate __init__() working.
+        return getattr(self, "_atomic_delivery_enabled", False)
+
+    def _keeps_failed_staging(self) -> bool:
+        return getattr(self, "_keep_failed_staging_enabled", False)
+
     def store(self, file: IO[bytes]) -> Deferred[None]:
+        if self._is_atomic():
+            return deferred_from_coro(self._store_atomically(file))
         return deferred_from_coro(run_in_thread(self._store_in_thread, file))
+
+    async def _store_atomically(self, file: IO[bytes]) -> None:
+        """Upload the staging *file*, which is the single commit point, and
+        remove the staging on success. A failed upload leaves the staging in
+        place, closed, for the FeedExporter to remove or keep according to
+        the feed options; the target is left untouched by the upload."""
+        try:
+            await run_in_thread(self._store_in_thread, file)
+        except Exception:
+            if not self._keeps_failed_staging():
+                _remove_staging(file)
+            raise
+        _remove_staging(file)
 
     @abstractmethod
     def _store_in_thread(self, file: IO[bytes]) -> None:
@@ -222,6 +344,8 @@ class StdoutFeedStorage:
 
     # The mode is irrelevant here: writing to a stream cannot destroy data.
     supported_modes: frozenset[str] = _FEED_MODES
+    # A stream cannot be staged and then delivered in one operation.
+    supports_atomic_delivery: bool = False
 
     def __init__(
         self,
@@ -256,28 +380,95 @@ class FileFeedStorage:
     """
 
     supported_modes: frozenset[str] = _FEED_MODES
+    supports_atomic_delivery: bool = True
 
     def __init__(self, uri: str, *, feed_options: dict[str, Any] | None = None):
+        feed_options = feed_options or {}
         self.path: str = file_uri_to_path(uri) if uri.startswith("file:") else uri
         self.write_mode: OpenBinaryMode = _WRITE_MODES[
             _get_mode(self, feed_options, "append")
         ]
+        self._atomic_delivery: bool = bool(feed_options.get("atomic_delivery"))
 
     def open(self, spider: Spider) -> IO[bytes]:
         dirname = Path(self.path).parent
         if dirname and not dirname.exists():
             dirname.mkdir(parents=True)
-        return Path(self.path).open(self.write_mode)
+        if not self._atomic_delivery:
+            return Path(self.path).open(self.write_mode)
+        # The staging file lives in the directory of the target, because
+        # replacing and hard linking are only atomic within one filesystem.
+        # It is opened for reading too, so that it can be checksummed after
+        # being written. The target itself is not opened or created here.
+        target = Path(self.path)
+        return NamedTemporaryFile(
+            mode="w+b",
+            prefix=f".{target.name}.",
+            suffix=f".{uuid4().hex}.staging",
+            dir=target.parent,
+            delete=False,
+        )
 
     def store(self, file: IO[bytes]) -> Deferred[None] | None:
+        if not self._atomic_delivery:
+            file.close()
+            return None
         file.close()
+        staging = Path(cast("str", _staging_name(file)))
+        target = Path(self.path)
+        if self.write_mode == "ab":
+            self._store_atomic_append(staging, target)
+        elif self.write_mode == "xb":
+            # os.link() creates the target only if it is absent, and it never
+            # modifies an existing target, unlike replacing it.
+            os.link(staging, target)
+            with contextlib.suppress(OSError):
+                staging.unlink(missing_ok=True)
+        else:
+            staging.replace(target)
+        _fsync_directory(target.parent)
         return None
+
+    @staticmethod
+    def _store_atomic_append(staging: Path, target: Path) -> None:
+        """Deliver *staging* in append mode by writing the old target and the
+        staging into a second staging file and replacing the target with it
+        in one operation. The target is never modified in place."""
+        if not target.exists():
+            staging.replace(target)
+            return
+        combined = NamedTemporaryFile(
+            mode="w+b",
+            prefix=f".{target.name}.",
+            suffix=f".{uuid4().hex}.staging",
+            dir=target.parent,
+            delete=False,
+        )
+        combined_path = Path(combined.name)
+        try:
+            with combined, target.open("rb") as existing:
+                shutil.copyfileobj(existing, combined)
+                with staging.open("rb") as new_data:
+                    shutil.copyfileobj(new_data, combined)
+                combined.flush()
+                os.fsync(combined.fileno())
+            combined_path.replace(target)
+        except Exception:
+            # The combined staging is an internal copy, not the staging the
+            # FeedExporter accounts for: never leave it behind.
+            with contextlib.suppress(OSError):
+                combined_path.unlink(missing_ok=True)
+            raise
+        with contextlib.suppress(OSError):
+            staging.unlink(missing_ok=True)
 
 
 class S3FeedStorage(BlockingFeedStorage):
     """:ref:`Amazon S3 <topics-feed-storage-s3>` storage backend."""
 
     supported_modes: frozenset[str] = frozenset({"create", "overwrite"})
+    supports_atomic_delivery: bool = True
+    atomic_modes: frozenset[str] = frozenset({"create", "overwrite"})
 
     def __init__(
         self,
@@ -329,6 +520,7 @@ class S3FeedStorage(BlockingFeedStorage):
             config=Config(**config_kwargs),
         )
 
+        super().__init__(feed_options=feed_options)
         self._mode: str = _get_mode(self, feed_options, "overwrite")
 
     @classmethod
@@ -399,6 +591,7 @@ class GCSFeedStorage(BlockingFeedStorage):
     """:ref:`GCS <topics-feed-storage-gcs>` storage backend."""
 
     supported_modes: frozenset[str] = _FEED_MODES
+    supports_atomic_delivery: bool = True
 
     def __init__(
         self,
@@ -417,6 +610,7 @@ class GCSFeedStorage(BlockingFeedStorage):
         self.bucket_name: str = u.hostname
         self.blob_name: str = u.path[1:]  # remove first "/"
 
+        super().__init__(feed_options=feed_options)
         self._mode: str = _get_mode(self, feed_options, "overwrite")
 
     @classmethod
@@ -487,6 +681,10 @@ class FTPFeedStorage(BlockingFeedStorage):
     :ref:`FTPS <feed-storage-ftps>` when *uri* uses the ``ftps`` scheme."""
 
     supported_modes: frozenset[str] = _FEED_MODES
+    supports_atomic_delivery: bool = True
+    # FTP can only append by streaming to the target (APPE), which cannot be
+    # made atomic; atomic delivery uploads to a temporary name and renames.
+    atomic_modes: frozenset[str] = frozenset({"create", "overwrite"})
 
     def __init__(
         self,
@@ -507,6 +705,7 @@ class FTPFeedStorage(BlockingFeedStorage):
         self.tls: bool = u.scheme == "ftps"
         self.use_active_mode: bool = use_active_mode
         self.timeout: float | None = timeout
+        super().__init__(feed_options=feed_options)
         self._mode: str = _get_mode(self, feed_options, "overwrite")
 
     @property
@@ -545,6 +744,7 @@ class FTPFeedStorage(BlockingFeedStorage):
             mode=self._mode,
             tls=self.tls,
             timeout=self.timeout,
+            atomic=self._is_atomic(),
         )
 
 
@@ -566,6 +766,7 @@ class FeedSlot:
     ):
         self.file: IO[bytes] | None = None
         self.exporter: BaseItemExporter | None = None
+        self.delivery: FeedDelivery | None = None
         self.storage: FeedStorageProtocol = storage
         # feed params
         self.batch_id: int = batch_id
@@ -643,6 +844,7 @@ class FeedExporter:
         self.settings: Settings = crawler.settings
         self.feeds: dict[str, dict[str, Any]] = {}
         self.slots: list[FeedSlot] = []
+        self.manifest: list[FeedDelivery] = []
         self.filters: dict[str, ItemFilter] = {}
         self.processors: dict[str, _ItemProcessor | None] = {}
         self._pending_close_tasks: list[asyncio.Task[None] | Deferred[None]] = []
@@ -770,7 +972,9 @@ class FeedExporter:
                 )
 
         # Send FEED_EXPORTER_CLOSED signal
-        await self.crawler.signals.send_catch_log_async(signals.feed_exporter_closed)
+        await self.crawler.signals.send_catch_log_async(
+            signals.feed_exporter_closed, manifest=tuple(self.manifest)
+        )
 
     def _schedule_slot_close(
         self, slot: FeedSlot, spider: Spider
@@ -802,19 +1006,59 @@ class FeedExporter:
             return slot_.file.file
         return slot_.file
 
+    @staticmethod
+    def _finalize_staging(file: IO[bytes]) -> tuple[int, str]:
+        """Flush staging *file* to disk and return its size and checksum.
+
+        Any raised exception aborts the delivery before
+        :meth:`FeedStorageProtocol.store` is called, so the target cannot
+        receive partial data."""
+        file.flush()
+        os.fsync(file.fileno())
+        size = os.fstat(file.fileno()).st_size
+        file.seek(0)
+        digest = hashlib.new(_CHECKSUM_ALGORITHM)
+        while chunk := file.read(1024 * 1024):
+            digest.update(chunk)
+        file.seek(0)
+        return size, digest.hexdigest()
+
+    @staticmethod
+    def _close_file(file: IO[bytes] | None, slot: FeedSlot) -> IO[bytes] | None:
+        """Close *file*, or the file of *slot* if it was not unwrapped yet
+        (finalization failed inside post-processing), swallowing errors."""
+        if file is None:
+            file = slot.file
+        if isinstance(file, PostProcessingManager):
+            with contextlib.suppress(Exception):
+                file.close()
+            file = file.file
+        if file is not None:
+            with contextlib.suppress(Exception):
+                file.close()
+        return file
+
+    def _discard_staging(self, file: IO[bytes] | None, slot: FeedSlot) -> str | None:
+        """Apply the staging residue policy after a failed delivery.
+
+        Close the staging file, remove it unless the feed opts to keep failed
+        staging files, and return its path in the latter case."""
+        file = self._close_file(file, slot)
+        name = _staging_name(file) if file is not None else None
+        if not name or not slot.feed_options.get("atomic_delivery"):
+            return None
+        if slot.feed_options.get("keep_failed_staging"):
+            return name
+        assert file is not None
+        _remove_staging(file)
+        return None
+
     async def _close_slot(self, slot: FeedSlot, spider: Spider) -> None:
         if slot._skipped:
             return
 
-        if slot.itemcount:
-            # Normal case
-            await slot.finish_exporting()
-        elif slot.store_empty and slot.batch_id == 1:
-            # Need to store the empty file
-            await slot.start_exporting()
-            await slot.finish_exporting()
-        else:
-            # In this case, the file is not stored, so no processing is required.
+        if not slot.itemcount and not (slot.store_empty and slot.batch_id == 1):
+            # The file is not stored, so no processing is required.
             return
 
         logmsg = f"{slot.format} feed ({slot.itemcount} items) in: {slot.uri}"
@@ -822,21 +1066,74 @@ class FeedExporter:
         self.crawler.stats.inc_value(
             f"feedexport/item_count/{slot_type}", slot.itemcount
         )
+
+        file: IO[bytes] | None = None
+        size: int | None = None
+        checksum: str | None = None
+        error: str | None = None
+        staging_path: str | None = None
+        atomic_delivery = bool(slot.feed_options.get("atomic_delivery"))
+        status: str
+
         try:
-            await ensure_awaitable(slot.storage.store(self._get_file(slot)))
-        except FileExistsError:
+            if slot.itemcount:
+                # Normal case
+                await slot.finish_exporting()
+            else:
+                # Need to store the empty file
+                await slot.start_exporting()
+                await slot.finish_exporting()
+            file = self._get_file(slot)
+            if atomic_delivery:
+                size, checksum = self._finalize_staging(file)
+            await ensure_awaitable(slot.storage.store(file))
+        except FileExistsError as exc:
             self._skip(slot)
             self.crawler.stats.inc_value(f"feedexport/failed_count/{slot_type}")
-        except Exception:
+            status = _DELIVERY_SKIPPED
+            error = f"{type(exc).__name__}: {exc}"
+            staging_path = self._discard_staging(file, slot)
+        except Exception as exc:
             logger.exception(
                 "Error storing %s",
                 logmsg,
                 extra={"spider": spider},
             )
             self.crawler.stats.inc_value(f"feedexport/failed_count/{slot_type}")
+            status = _DELIVERY_FAILED
+            error = f"{type(exc).__name__}: {exc}"
+            staging_path = self._discard_staging(file, slot)
         else:
             logger.info("Stored %s", logmsg, extra={"spider": spider})
             self.crawler.stats.inc_value(f"feedexport/success_count/{slot_type}")
+            status = _DELIVERY_DELIVERED
+            if atomic_delivery:
+                logger.debug(
+                    f"Atomically delivered {slot.uri}: {size} bytes, "
+                    f"{_CHECKSUM_ALGORITHM}={checksum}",
+                    extra={"spider": spider},
+                )
+
+        if staging_path is not None:
+            logger.error(
+                f"Staging file of the undelivered feed kept at: {staging_path}",
+                extra={"spider": spider},
+            )
+
+        delivery = FeedDelivery(
+            uri=slot.uri,
+            batch_id=slot.batch_id,
+            format=slot.format,
+            storage=slot_type,
+            item_count=slot.itemcount,
+            size=size,
+            checksum=checksum,
+            status=status,
+            error=error,
+            staging_path=staging_path,
+        )
+        slot.delivery = delivery
+        self.manifest.append(delivery)
 
         await self.crawler.signals.send_catch_log_async(
             signals.feed_slot_closed, slot=slot
@@ -975,6 +1272,7 @@ class FeedExporter:
             try:
                 storage = self._get_storage(uri, feed_options)
                 self._check_storage_mode(uri, storage, feed_options)
+                self._check_atomic_delivery(uri, storage, feed_options)
                 return True
             except NotConfigured as e:
                 logger.error(
@@ -1001,6 +1299,34 @@ class FeedExporter:
             )
             return
         _check_mode(mode, storage, uri)
+
+    @staticmethod
+    def _check_atomic_delivery(
+        uri: str, storage: FeedStorageProtocol, feed_options: dict[str, Any]
+    ) -> None:
+        if not feed_options.get("atomic_delivery"):
+            return
+        if not getattr(storage, "supports_atomic_delivery", False):
+            if isinstance(storage, StdoutFeedStorage):
+                logger.warning(
+                    f"Atomic feed delivery is not supported by "
+                    f"{type(storage).__name__} ({uri}); the feed is written "
+                    "directly to the stream instead."
+                )
+                feed_options["atomic_delivery"] = False
+                return
+            raise ValueError(
+                f"{type(storage).__name__} does not support atomic feed "
+                f"delivery (feed URI: {uri})."
+            )
+        mode = feed_options.get("mode")
+        atomic_modes = getattr(storage, "atomic_modes", None)
+        if mode is not None and atomic_modes is not None and mode not in atomic_modes:
+            raise ValueError(
+                f"{type(storage).__name__} does not support atomic feed "
+                f"delivery in {mode!r} mode (feed URI: {uri}). Supported "
+                f"modes: {', '.join(sorted(atomic_modes))}."
+            )
 
     def _get_storage(
         self, uri: str, feed_options: dict[str, Any]
