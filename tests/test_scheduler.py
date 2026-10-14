@@ -434,7 +434,7 @@ class _PriorityQueueWithoutNextPriority:
     def pop(self) -> Request | None:
         return self._queue.pop()
 
-    def close(self) -> list[int]:
+    def close(self) -> list[int] | dict[str, Any]:
         return self._queue.close()
 
     def __len__(self) -> int:
@@ -481,3 +481,73 @@ async def test_unserializable_requests(
     assert crawler.stats.get_value("scheduler/unserializable") == 2
     assert crawler.stats.get_value("scheduler/enqueued/memory") == 2
     assert caplog.text.count("Unable to serialize request") == 1
+
+
+@coroutine_test
+async def test_priority_boost_stats() -> None:
+    settings = {
+        "SCHEDULER_PRIORITY_BOOST_ROUNDS": 3,
+        "SCHEDULER_PRIORITY_BOOST_STEP": 2,
+    }
+    async with create_scheduler(
+        "scrapy.pqueues.ScrapyPriorityQueue", None, **settings
+    ) as scheduler:
+        low_url = "https://example.org/low"
+        scheduler.enqueue_request(Request(low_url, priority=-5))
+        dequeued = []
+        for index in range(12):
+            scheduler.enqueue_request(
+                Request(f"https://example.org/h{index}", priority=0)
+            )
+            request = scheduler.next_request()
+            assert request is not None
+            dequeued.append(request.url)
+        while request := scheduler.next_request():
+            dequeued.append(request.url)
+
+        assert dequeued[9] == low_url
+        assert dequeued.count(low_url) == 1
+        assert len(dequeued) == 13
+        stats = scheduler.stats
+        assert stats is not None
+        # The low-priority request is boosted. h9, pushed at round 9 and
+        # buried by later requests in the LIFO queue, reaches one boost
+        # level by the time it is dequeued.
+        assert stats.get_value("scheduler/dequeued/priority_boosted") == 2
+        assert stats.get_value("scheduler/dequeued/wait_time/max") is not None
+
+
+@coroutine_test
+async def test_wait_time_stats_without_boost() -> None:
+    async with create_scheduler(
+        "scrapy.pqueues.ScrapyPriorityQueue", None
+    ) as scheduler:
+        scheduler.enqueue_request(Request("https://example.org/1"))
+        assert scheduler.next_request() is not None
+        stats = scheduler.stats
+        assert stats is not None
+        assert stats.get_value("scheduler/dequeued/priority_boosted") is None
+        assert stats.get_value("scheduler/dequeued/wait_time/max") is not None
+
+
+@coroutine_test
+async def test_active_json_priority_boost(tmp_path: Path) -> None:
+    settings = {"SCHEDULER_PRIORITY_BOOST_ROUNDS": 3}
+    async with create_scheduler(
+        "scrapy.pqueues.ScrapyPriorityQueue", tmp_path, **settings
+    ) as scheduler:
+        for url, priority in _PRIORITIES:
+            scheduler.enqueue_request(Request(url, priority=priority))
+
+    state = _active_json(tmp_path)
+    assert isinstance(state, dict)
+    assert set(state) == {"p", "a", "r"}
+    assert state["p"] == [-2, -1, 0, 1, 2]
+
+    async with create_scheduler(
+        "scrapy.pqueues.ScrapyPriorityQueue", tmp_path, **settings
+    ) as scheduler:
+        dequeued = 0
+        while scheduler.next_request() is not None:
+            dequeued += 1
+        assert dequeued == len(_PRIORITIES)

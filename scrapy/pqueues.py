@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import logging
+import time
 from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, Self, cast
@@ -14,6 +16,9 @@ if TYPE_CHECKING:
     from scrapy import Request
     from scrapy.core.downloader import Downloader
     from scrapy.crawler import Crawler
+
+# (enqueue time in time.time() seconds, dequeue rounds at enqueue)
+_AgeEntry = tuple[float, int]
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +56,8 @@ class QueueProtocol(Protocol):
 class PriorityQueueProtocol(Protocol):
     """Interface of :setting:`SCHEDULER_PRIORITY_QUEUE` classes.
 
-    :attr:`changed`, :meth:`next_priority` and :meth:`state` are optional.
+    :attr:`changed`, :attr:`last_pop_age`, :attr:`last_pop_boost`,
+    :meth:`next_priority` and :meth:`state` are optional.
     """
 
     @classmethod
@@ -97,6 +103,24 @@ class PriorityQueueProtocol(Protocol):
     the job runs, and resets this attribute after persisting it.
     """
 
+    last_pop_boost: int
+    """Priority points added to the request returned by the last
+    :meth:`pop` through request starvation protection, or ``0`` if the
+    request kept its declared priority.
+
+    Queues that do not implement starvation protection do not need this
+    attribute; the scheduler then assumes ``0``.
+    """
+
+    last_pop_age: float | None
+    """Seconds the request returned by the last :meth:`pop` spent queued, or
+    ``None`` if it is unknown (e.g. the queue was resumed from a state
+    without queuing-age data).
+
+    Queues that do not track queuing age do not need this attribute; the
+    scheduler then assumes ``None``.
+    """
+
     def next_priority(self) -> int | None:
         """Return the priority of the request that :meth:`pop` would return
         next, or ``None`` if the queue is empty.
@@ -115,6 +139,27 @@ class ScrapyPriorityQueue:
     """Priority queue that pops requests from highest to lowest
     :attr:`~scrapy.Request.priority`, in :ref:`request order <request-order>`
     within a priority.
+
+    Request starvation protection
+    ==============================
+
+    When :setting:`SCHEDULER_PRIORITY_BOOST_AGE` or
+    :setting:`SCHEDULER_PRIORITY_BOOST_ROUNDS` is set, requests of a given
+    priority that wait too long are scheduled at a higher effective priority.
+    Every additional threshold interval adds another
+    :setting:`SCHEDULER_PRIORITY_BOOST_STEP` priority points, up to
+    :setting:`SCHEDULER_PRIORITY_BOOST_CAP`. Boosting is virtual: the
+    :attr:`~scrapy.Request.priority` attribute of requests is never modified,
+    and the boost no longer applies once a request is popped. Requests
+    re-enqueued later (e.g. retries) are new requests that start waiting from
+    zero.
+
+    Requests share one downstream queue per declared priority, so the whole
+    priority starts being boosted as soon as its oldest waiting request
+    crosses a threshold; the request order inside that queue does not change.
+    :ref:`Start requests <start-requests>` are never boosted. With both
+    thresholds left at their default of ``0``, the dequeue order is the same
+    as without starvation protection.
 
     Disk persistence
     ================
@@ -138,6 +183,11 @@ class ScrapyPriorityQueue:
     passed) with *key* set to a subdirectory of the persistence directory,
     named as the negated request priority (e.g. ``-1``), with an ``s`` suffix
     in case of a start request (e.g. ``-1s``).
+
+    When request starvation protection is enabled, the state returned by
+    :meth:`state` also stores the queuing age of every request (enqueue time,
+    dequeue rounds at enqueue, the current dequeue-round counter), so that it
+    resumes when the job is resumed.
     """
 
     @classmethod
@@ -146,7 +196,7 @@ class ScrapyPriorityQueue:
         crawler: Crawler,
         downstream_queue_cls: type[QueueProtocol],
         key: str,
-        startprios: Iterable[int] = (),
+        startprios: Iterable[int] | dict[str, Any] = (),
         *,
         start_queue_cls: type[QueueProtocol] | None = None,
     ) -> Self:
@@ -163,7 +213,7 @@ class ScrapyPriorityQueue:
         crawler: Crawler,
         downstream_queue_cls: type[QueueProtocol],
         key: str,
-        startprios: Iterable[int] = (),
+        startprios: Iterable[int] | dict[str, Any] = (),
         *,
         start_queue_cls: type[QueueProtocol] | None = None,
     ):
@@ -175,13 +225,47 @@ class ScrapyPriorityQueue:
         self._start_queues: dict[int, QueueProtocol] = {}
         self.curprio: int | None = None
         self.changed: bool = False
+        settings = crawler.settings
+        self._boost_age: float = settings.getfloat("SCHEDULER_PRIORITY_BOOST_AGE")
+        self._boost_rounds: int = settings.getint("SCHEDULER_PRIORITY_BOOST_ROUNDS")
+        self._boost_step: int = settings.getint("SCHEDULER_PRIORITY_BOOST_STEP")
+        self._boost_cap: int = settings.getint("SCHEDULER_PRIORITY_BOOST_CAP")
+        if self._boost_age < 0 or self._boost_rounds < 0:
+            raise ValueError(
+                "SCHEDULER_PRIORITY_BOOST_AGE and "
+                "SCHEDULER_PRIORITY_BOOST_ROUNDS must not be negative"
+            )
+        if self._boost_step < 1 or self._boost_cap < 1:
+            raise ValueError(
+                "SCHEDULER_PRIORITY_BOOST_STEP and "
+                "SCHEDULER_PRIORITY_BOOST_CAP must be greater than 0"
+            )
+        self._boost_enabled: bool = self._boost_age > 0 or self._boost_rounds > 0
+        self._max_boost_levels: int = self._boost_cap // self._boost_step
+        # Per priority bucket, request id -> (enqueue time, rounds at
+        # enqueue) for non-start requests. The request id heap gives the
+        # oldest entry: ids start with the enqueue time in milliseconds.
+        self._ages: dict[int, dict[int, _AgeEntry]] = {}
+        self._age_heaps: dict[int, list[int]] = {}
+        self._rounds: int = 0
+        # Information about the last pop(), read by the scheduler for stats.
+        self.last_pop_boost: int = 0
+        self.last_pop_age: float | None = None
         self.init_prios(startprios)
 
-    def init_prios(self, startprios: Iterable[int]) -> None:
+    def init_prios(self, startprios: Iterable[int] | dict[str, Any]) -> None:
         if not startprios:
             return
 
-        for priority in startprios:
+        ages: dict[str, Any] = {}
+        if isinstance(startprios, dict):
+            prios: Iterable[int] = startprios.get("p", ())
+            ages = startprios.get("a", {})
+            self._rounds = int(startprios.get("r", 0))
+        else:
+            prios = startprios
+
+        for priority in prios:
             q = self.qfactory(priority)
             if q:
                 self.queues[priority] = q
@@ -196,7 +280,19 @@ class ScrapyPriorityQueue:
                     q.close()
                     self.changed = True
 
-        self._update_curprio()
+        for raw_key, entries in ages.items():
+            bucket_key = int(raw_key)
+            if bucket_key not in self.queues:
+                # The downstream queue for these requests no longer exists.
+                continue
+            bucket_ages = {
+                int(request_id): (float(enqueue_time), int(enqueue_round))
+                for request_id, enqueue_time, enqueue_round in entries
+            }
+            self._ages[bucket_key] = bucket_ages
+            heap = list(bucket_ages)
+            heapq.heapify(heap)
+            self._age_heaps[bucket_key] = heap
 
     def qfactory(self, key: int) -> QueueProtocol:
         return build_from_crawler(
@@ -224,54 +320,129 @@ class ScrapyPriorityQueue:
                 self._start_queues[priority] = self._sqfactory(priority)
                 self.changed = True
             q = self._start_queues[priority]
-        else:
-            if priority not in self.queues:
-                self.queues[priority] = self.qfactory(priority)
-                self.changed = True
-            q = self.queues[priority]
+            q.push(request)  # this may fail (eg. serialization error)
+            return
+        if priority not in self.queues:
+            self.queues[priority] = self.qfactory(priority)
+            self.changed = True
+        q = self.queues[priority]
         q.push(request)  # this may fail (eg. serialization error)
-        if self.curprio is None or priority < self.curprio:
-            self.curprio = priority
+        # Bookkeeping only after the request is stored downstream, so a
+        # failed push (e.g. a serialization error) leaves no age entry.
+        self._ages.setdefault(priority, {})[request.id] = (
+            time.time(),
+            self._rounds,
+        )
+        heapq.heappush(self._age_heaps.setdefault(priority, []), request.id)
+        if self._boost_enabled:
+            # The aging state is part of the persisted state.
+            self.changed = True
 
     def pop(self) -> Request | None:
-        while self.curprio is not None:
-            try:
-                q = self.queues[self.curprio]
-            except KeyError:
-                pass
-            else:
-                m = q.pop()
-                if not q:
-                    del self.queues[self.curprio]
-                    q.close()
-                    self.changed = True
-                    self._update_curprio()
-                return m
-            if self._start_queues:
-                try:
-                    q = self._start_queues[self.curprio]
-                except KeyError:
-                    self._update_curprio()
+        while True:
+            selection = self._select_next()
+            if selection is None:
+                self.curprio = None
+                return None
+            is_start, key, effective_key = selection
+            self.curprio = effective_key
+            q = self._start_queues.get(key) if is_start else self.queues.get(key)
+            # _select_next() only lists keys of queues that hold requests.
+            assert q is not None
+            request = q.pop()
+            if request is not None:
+                # Account before the drained bucket drops its age ledger.
+                self._after_pop(is_start, key, request)
+            if not q:
+                if is_start:
+                    del self._start_queues[key]
                 else:
-                    m = q.pop()
-                    if not q:
-                        del self._start_queues[self.curprio]
-                        q.close()
-                        self.changed = True
-                        self._update_curprio()
-                    return m
-            else:
-                self._update_curprio()
+                    del self.queues[key]
+                    self._ages.pop(key, None)
+                    self._age_heaps.pop(key, None)
+                q.close()
+                self.changed = True
+            if request is not None:
+                return request
+
+    def _select_next(self) -> tuple[bool, int, int] | None:
+        """Return ``(is_start, declared key, effective key)`` for the next
+        request to pop, or ``None`` when all queues are empty.
+
+        Normal queues pop at their starvation-boosted effective key, and take
+        precedence over start queues on a tie. Start queues always use their
+        declared key, as start requests are never boosted.
+        """
+        now = time.time()
+        normal_effective_key: int | None = None
+        normal_key: int | None = None
+        for key in self.queues:
+            effective_key = key - self._bucket_level(key, now) * self._boost_step
+            if (
+                normal_effective_key is None
+                or effective_key < normal_effective_key
+                or (
+                    effective_key == normal_effective_key
+                    and (normal_key is None or key < normal_key)
+                )
+            ):
+                normal_effective_key = effective_key
+                normal_key = key
+        start_key = min(self._start_queues) if self._start_queues else None
+        if (
+            normal_effective_key is not None
+            and normal_key is not None
+            and (start_key is None or normal_effective_key <= start_key)
+        ):
+            return False, normal_key, normal_effective_key
+        if start_key is not None:
+            return True, start_key, start_key
         return None
 
-    def _update_curprio(self) -> None:
-        prios = {
-            p
-            for queues in (self.queues, self._start_queues)
-            for p, q in queues.items()
-            if q
-        }
-        self.curprio = min(prios) if prios else None
+    def _oldest_entry(self, key: int) -> _AgeEntry | None:
+        ages = self._ages.get(key)
+        if not ages:
+            return None
+        heap = self._age_heaps[key]
+        while heap and heap[0] not in ages:
+            heapq.heappop(heap)
+        if not heap:
+            return None
+        return ages[heap[0]]
+
+    def _bucket_level(self, key: int, now: float) -> int:
+        if not self._boost_enabled:
+            return 0
+        oldest = self._oldest_entry(key)
+        if oldest is None:
+            return 0
+        enqueue_time, enqueue_round = oldest
+        level = 0
+        if self._boost_age:
+            waited_age = now - enqueue_time
+            if waited_age >= self._boost_age:
+                level = int(waited_age // self._boost_age)
+        if self._boost_rounds:
+            waited_rounds = self._rounds - enqueue_round
+            if waited_rounds >= self._boost_rounds:
+                level = max(level, waited_rounds // self._boost_rounds)
+        return min(level, self._max_boost_levels)
+
+    def _after_pop(self, is_start: bool, key: int, request: Request) -> None:
+        now = time.time()
+        self.last_pop_boost = 0
+        self.last_pop_age = None
+        if not is_start:
+            ages = self._ages.get(key)
+            if ages is not None:
+                self.last_pop_boost = self._bucket_level(key, now) * self._boost_step
+                entry = ages.pop(request.id, None)
+                if entry is not None:
+                    self.last_pop_age = max(0.0, now - entry[0])
+            if self._boost_enabled:
+                # The aging state is part of the persisted state.
+                self.changed = True
+        self._rounds += 1
 
     def peek(self) -> Request | None:
         """Returns the next object to be returned by :meth:`pop`,
@@ -280,22 +451,38 @@ class ScrapyPriorityQueue:
         Raises :exc:`NotImplementedError` if the underlying queue class does
         not implement a ``peek`` method, which is optional for queues.
         """
-        if self.curprio is None:
+        selection = self._select_next()
+        if selection is None:
             return None
-        try:
-            queue = self._start_queues[self.curprio]
-        except KeyError:
-            queue = self.queues[self.curprio]
+        is_start, key, _effective_key = selection
+        queue = self._start_queues.get(key) if is_start else self.queues.get(key)
+        assert queue is not None
         # Protocols can't declare optional members
         return cast("Request", queue.peek())  # type: ignore[attr-defined]
 
     def next_priority(self) -> int | None:
+        selection = self._select_next()
+        if selection is None:
+            self.curprio = None
+            return None
+        self.curprio = selection[2]
         return self.curprio
 
-    def state(self) -> list[int]:
-        return sorted(self.queues.keys() | self._start_queues.keys())
+    def state(self) -> list[int] | dict[str, Any]:
+        prios = sorted(self.queues.keys() | self._start_queues.keys())
+        if not self._boost_enabled:
+            return prios
+        ages = {
+            str(key): sorted(
+                [request_id, enqueue_time, enqueue_round]
+                for request_id, (enqueue_time, enqueue_round) in bucket.items()
+            )
+            for key, bucket in self._ages.items()
+            if bucket
+        }
+        return {"p": prios, "a": ages, "r": self._rounds}
 
-    def close(self) -> list[int]:
+    def close(self) -> list[int] | dict[str, Any]:
         active = self.state()
         for queues in (self.queues, self._start_queues):
             for q in queues.values():
@@ -355,6 +542,11 @@ class DownloaderAwarePriorityQueue:
     For each download slot, this class creates an instance of
     :class:`ScrapyPriorityQueue` with the download slot subdirectory as *key*
     and its own *downstream_queue_cls*.
+
+    Request starvation protection (see
+    :setting:`SCHEDULER_PRIORITY_BOOST_AGE`) is applied independently inside
+    every slot queue: the dequeue-round threshold counts requests dequeued
+    from the same slot. Slot selection still follows downloader activity.
     """
 
     @classmethod
@@ -363,7 +555,7 @@ class DownloaderAwarePriorityQueue:
         crawler: Crawler,
         downstream_queue_cls: type[QueueProtocol],
         key: str,
-        startprios: dict[str, Iterable[int]] | None = None,
+        startprios: dict[str, Any] | None = None,
         *,
         start_queue_cls: type[QueueProtocol] | None = None,
     ) -> Self:
@@ -380,7 +572,7 @@ class DownloaderAwarePriorityQueue:
         crawler: Crawler,
         downstream_queue_cls: type[QueueProtocol],
         key: str,
-        slot_startprios: dict[str, Iterable[int]] | None = None,
+        slot_startprios: dict[str, Any] | None = None,
         *,
         start_queue_cls: type[QueueProtocol] | None = None,
     ):
@@ -409,6 +601,9 @@ class DownloaderAwarePriorityQueue:
         self.pqueues: dict[str, ScrapyPriorityQueue] = {}  # slot -> priority queue
         self._last_selected_slot: str | None = None
         self.changed: bool = False
+        # Information about the last pop(), read by the scheduler for stats.
+        self.last_pop_boost: int = 0
+        self.last_pop_age: float | None = None
         if slot_startprios:
             for slot, startprios in slot_startprios.items():
                 self.pqueues[slot] = self.pqfactory(slot, startprios)
@@ -442,7 +637,7 @@ class DownloaderAwarePriorityQueue:
         return slot
 
     def pqfactory(
-        self, slot: str, startprios: Iterable[int] = ()
+        self, slot: str, startprios: Iterable[int] | dict[str, Any] = ()
     ) -> ScrapyPriorityQueue:
         return ScrapyPriorityQueue(
             self.crawler,
@@ -460,12 +655,16 @@ class DownloaderAwarePriorityQueue:
     def pop(self) -> Request | None:
         stats = self._downloader_interface.stats(self.pqueues)
 
+        self.last_pop_boost = 0
+        self.last_pop_age = None
         if not stats:
             return None
 
         slot = self._next_slot(stats, update_state=True)
         queue = self.pqueues[slot]
         request = queue.pop()
+        self.last_pop_boost = queue.last_pop_boost
+        self.last_pop_age = queue.last_pop_age
         self._collect_change(queue)
         if len(queue) == 0:
             del self.pqueues[slot]
@@ -508,10 +707,10 @@ class DownloaderAwarePriorityQueue:
         slot = self._next_slot(stats, update_state=False)
         return self.pqueues[slot].next_priority()
 
-    def state(self) -> dict[str, list[int]]:
+    def state(self) -> dict[str, Any]:
         return {slot: queue.state() for slot, queue in self.pqueues.items()}
 
-    def close(self) -> dict[str, list[int]]:
+    def close(self) -> dict[str, Any]:
         active = self.state()
         for queue in self.pqueues.values():
             queue.close()

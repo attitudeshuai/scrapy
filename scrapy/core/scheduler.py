@@ -228,8 +228,42 @@ class Scheduler(BaseScheduler):
 
     As a result, the first few requests of a crawl may not follow the desired
     order. Lowering those settings to ``1`` enforces the desired order except
-    for the very first request, but it significantly slows down the crawl as a
-    whole.
+    for the very first request, but it significantly slows down the crawl as
+    a whole.
+
+    .. _request-starvation-protection:
+
+    Request starvation protection
+    ==============================
+
+    A continuous stream of high-priority requests can keep lower-priority
+    requests waiting indefinitely. When
+    :setting:`SCHEDULER_PRIORITY_BOOST_AGE` or
+    :setting:`SCHEDULER_PRIORITY_BOOST_ROUNDS` is set, requests of a priority
+    that wait longer than the configured threshold are scheduled at a higher
+    effective priority. Every additional threshold interval adds
+    :setting:`SCHEDULER_PRIORITY_BOOST_STEP` priority points, up to
+    :setting:`SCHEDULER_PRIORITY_BOOST_CAP`. The round threshold counts
+    dequeued requests from the same priority queue, which, with
+    :class:`~scrapy.pqueues.DownloaderAwarePriorityQueue`, means requests
+    dequeued from the same domain slot.
+
+    Boosting is only an internal ordering decision. The
+    :attr:`~scrapy.http.Request.priority` attribute of requests is never
+    modified, and the boost no longer applies once a request is dequeued. A
+    request enqueued again later, such as a retry, starts waiting from zero.
+    Requests of a declared priority share a queue, so the whole priority is
+    boosted together once its oldest request waits long enough, and the order
+    within that queue does not change. :ref:`Start requests
+    <start-requests>` are never boosted.
+
+    The :stat:`scheduler/dequeued/priority_boosted` stat counts requests
+    dequeued with a boosted priority, and
+    :stat:`scheduler/dequeued/wait_time/max` tracks the longest queuing time
+    of dequeued requests.
+
+    With both thresholds left at their default of ``0``, boosting is
+    disabled and the dequeue order is unchanged.
 
     Job directory contents
     ======================
@@ -247,14 +281,18 @@ class Scheduler(BaseScheduler):
 
     -   Generates inside that directory an ``active.json`` file with a JSON
         representation of the state (``startprios``) of
-        :setting:`SCHEDULER_PRIORITY_QUEUE`.
+        :setting:`SCHEDULER_PRIORITY_QUEUE`. When request starvation
+        protection is enabled, it also contains the queuing age of the stored
+        requests, so that it resumes when the job is resumed.
 
         The file is generated whenever the job stops (cleanly) and is loaded
         when resuming the job. If :setting:`JOBDIR_SYNC_EVERY` is set and the
         priority queue implements
         :attr:`~scrapy.pqueues.PriorityQueueProtocol.changed` and
         :meth:`~scrapy.pqueues.PriorityQueueProtocol.state`, the file is also
-        generated while the job runs.
+        generated while the job runs. A state produced without starvation
+        protection can be resumed with it enabled and vice versa; queuing age
+        is only available when the state was produced with it enabled.
 
     -   Instantiates the configured :setting:`SCHEDULER_PRIORITY_QUEUE` with
         ``requests.queue/`` as persistence directory (*key*) and
@@ -424,17 +462,25 @@ class Scheduler(BaseScheduler):
         :stat:`scheduler/dequeued/disk`, :stat:`scheduler/dequeued/memory`.
         """
         request: Request | None = None
+        queue: PriorityQueueProtocol | None = None
         assert self.stats is not None
         if not self._dqs_first():
             request = self.mqs.pop()
             if request is not None:
+                queue = self.mqs
                 self.stats.inc_value("scheduler/dequeued/memory")
         if request is None:
             request = self._dqpop()
             if request is not None:
+                queue = self.dqs
                 self.stats.inc_value("scheduler/dequeued/disk")
         if request is not None:
             self.stats.inc_value("scheduler/dequeued")
+            if getattr(queue, "last_pop_boost", 0):
+                self.stats.inc_value("scheduler/dequeued/priority_boosted")
+            wait_time = getattr(queue, "last_pop_age", None)
+            if wait_time is not None:
+                self.stats.max_value("scheduler/dequeued/wait_time/max", wait_time)
         return request
 
     def __len__(self) -> int:

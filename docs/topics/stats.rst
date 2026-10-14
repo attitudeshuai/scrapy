@@ -729,6 +729,19 @@ one per actual value of the placeholder.
     Number of requests read from the memory queue of the :ref:`scheduler
     <topics-scheduler>`.
 
+.. stat:: scheduler/dequeued/priority_boosted
+
+``scheduler/dequeued/priority_boosted``
+    Number of requests read from the :ref:`scheduler <topics-scheduler>`
+    whose effective priority was raised through :ref:`request starvation
+    protection <request-starvation-protection>`.
+
+.. stat:: scheduler/dequeued/wait_time/max
+
+``scheduler/dequeued/wait_time/max``
+    Longest time, in seconds, that a request read from the :ref:`scheduler
+    <topics-scheduler>` spent queued.
+
 .. stat:: scheduler/enqueued
 
 ``scheduler/enqueued``

@@ -2122,6 +2122,75 @@ Type of in-memory queue used by the scheduler. Other available type is:
 ``scrapy.squeues.FifoMemoryQueue``.
 
 
+.. setting:: SCHEDULER_PRIORITY_BOOST_AGE
+
+SCHEDULER_PRIORITY_BOOST_AGE
+----------------------------
+
+.. versionadded:: VERSION
+
+Default: ``0.0``
+
+Maximum time, in seconds, that a request may wait queued in the
+:ref:`scheduler <topics-scheduler>` before it is scheduled at a higher
+effective priority. Every additional interval of this length adds another
+:setting:`SCHEDULER_PRIORITY_BOOST_STEP` priority points, up to
+:setting:`SCHEDULER_PRIORITY_BOOST_CAP`.
+
+The default of ``0`` disables time-based priority boosting. See
+:ref:`request starvation protection <request-starvation-protection>`.
+
+
+.. setting:: SCHEDULER_PRIORITY_BOOST_CAP
+
+SCHEDULER_PRIORITY_BOOST_CAP
+----------------------------
+
+.. versionadded:: VERSION
+
+Default: ``100``
+
+Maximum number of priority points that request starvation protection (see
+:setting:`SCHEDULER_PRIORITY_BOOST_AGE`) can add to the effective priority
+of a request.
+
+
+.. setting:: SCHEDULER_PRIORITY_BOOST_ROUNDS
+
+SCHEDULER_PRIORITY_BOOST_ROUNDS
+-------------------------------
+
+.. versionadded:: VERSION
+
+Default: ``0``
+
+Number of other requests that must be dequeued from the same priority queue
+while a request waits, before that request is scheduled at a higher
+effective priority. Every additional interval of this length adds another
+:setting:`SCHEDULER_PRIORITY_BOOST_STEP` priority points, up to
+:setting:`SCHEDULER_PRIORITY_BOOST_CAP`.
+
+With :class:`~scrapy.pqueues.DownloaderAwarePriorityQueue`, dequeued
+requests are counted per download slot, i.e. the counter measures requests
+of the same domain dequeued while the request waited.
+
+The default of ``0`` disables round-based priority boosting.
+
+
+.. setting:: SCHEDULER_PRIORITY_BOOST_STEP
+
+SCHEDULER_PRIORITY_BOOST_STEP
+-----------------------------
+
+.. versionadded:: VERSION
+
+Default: ``1``
+
+Number of priority points added to the effective priority of a request every
+time it crosses a :setting:`SCHEDULER_PRIORITY_BOOST_AGE` or
+:setting:`SCHEDULER_PRIORITY_BOOST_ROUNDS` threshold interval.
+
+
 .. setting:: SCHEDULER_PRIORITY_QUEUE
 .. _broad-crawls-scheduler-priority-queue:
 
